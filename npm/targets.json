@@ -1,0 +1,7 @@
+{
+  "darwin-arm64": "contrib-scout",
+  "darwin-x64": "contrib-scout",
+  "linux-arm64": "contrib-scout",
+  "linux-x64": "contrib-scout",
+  "win32-x64": "contrib-scout.exe"
+}
