@@ -217,11 +217,11 @@ impl GhTransport {
         Ok(self.invocation(args, Some(serde_json::to_vec(&body)?)))
     }
 
+    /// Always names the host: with `GH_HOST` removed from the child's
+    /// environment, the target never depends on the caller's shell.
     fn base_args<const N: usize>(&self, leading: [&str; N]) -> Vec<String> {
         let mut args: Vec<String> = leading.iter().map(|&arg| arg.to_owned()).collect();
-        if !self.hostname.eq_ignore_ascii_case("github.com") {
-            args.extend(["--hostname".to_owned(), self.hostname.clone()]);
-        }
+        args.extend(["--hostname".to_owned(), self.hostname.clone()]);
         args
     }
 
@@ -237,7 +237,14 @@ impl GhTransport {
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect(),
-            env_remove: vec!["GH_FORCE_TTY".into(), "CLICOLOR_FORCE".into()],
+            // `GH_HOST` / `GH_REPO` would redirect requests to another host or
+            // fill `{owner}/{repo}`; the host is always passed as `--hostname`.
+            env_remove: vec![
+                "GH_FORCE_TTY".into(),
+                "CLICOLOR_FORCE".into(),
+                "GH_HOST".into(),
+                "GH_REPO".into(),
+            ],
             stdin,
             timeout: self.timeout,
         }

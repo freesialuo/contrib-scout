@@ -248,6 +248,8 @@ fn get_arguments_send_weak_etag_verbatim_and_force_get() {
             "-i",
             "--method",
             "GET",
+            "--hostname",
+            "github.com",
             "-H",
             "Accept: application/vnd.github.raw+json",
             "-H",
@@ -263,6 +265,19 @@ fn get_arguments_send_weak_etag_verbatim_and_force_get() {
     assert!(invocation
         .env
         .contains(&("GH_PROMPT_DISABLED".into(), "1".into())));
+    // The caller's GH_HOST / GH_REPO never reach gh.
+    for name in ["GH_HOST", "GH_REPO"] {
+        assert!(invocation.env_remove.iter().any(|n| n == name), "{name}");
+        assert!(!invocation.env.iter().any(|(n, _)| n == name), "{name}");
+    }
+    let graphql = GhTransport::new("gh")
+        .graphql_invocation("query { viewer { login } }", &serde_json::json!({}))
+        .unwrap();
+    assert_eq!(
+        &graphql.args[..5],
+        ["api", "graphql", "-i", "--hostname", "github.com"]
+    );
+    assert!(graphql.env_remove.iter().any(|n| n == "GH_HOST"));
 }
 
 #[test]
@@ -363,6 +378,8 @@ fn graphql_sends_json_body_on_stdin() {
             "api",
             "graphql",
             "-i",
+            "--hostname",
+            "github.com",
             "-H",
             "X-GitHub-Api-Version: 2022-11-28",
             "--input",
