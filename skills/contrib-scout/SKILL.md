@@ -40,14 +40,14 @@ Every command that touches a repository returns `meta.reminders`. Read them befo
    This returns raw files (org `{owner}/.github` first, then the repository) with path, permalink, and text; `truncated: true` means you only see part of it — follow the URL if the cut matters. **Read the text yourself.** Check also README sections and PR templates. Then record what you read:
    ```sh
    contrib-scout --json --agent ID policy set owner/repo --stance restricts \
-     --evidence CONTRIBUTING.md:40-52 \
+     --evidence CONTRIBUTING.md:40-42 \
      --forbid-label "good first issue" \
      --scope pr_text=human_written \
      --require disclose_in_pr --require assisted_by_trailer \
      --note "AI code ok if disclosed; PR text must be human-written; no AI on good first issues"
    ```
    - `--stance`: `bans`, `restricts`, `disclose`, `allows`, `welcomes`, `none_found`. Choose from the text, not from keywords alone; prohibitive words that are not about AI do not make a ban.
-   - Evidence is mandatory: the file path (or external URL, e.g. a project website) with lines. For `none_found`, list the paths you checked.
+   - Evidence is mandatory: the file path (or external URL, e.g. a project website) with lines. A range covers at most 3 lines (`PATH:40-42`); longer ranges are rejected, so quote the decisive lines and repeat `--evidence` for separate passages. For `none_found`, list the paths you checked.
    - Capture scope: `--forbid-label L` for "no AI on these issues"; `--scope needs_prior_approval=true` when maintainer approval on the issue is required first; `--scope pr_text=human_written`, `--scope comments=human_written`, `--scope autonomous_agents=forbidden` as stated.
    - Capture PR requirements with `--require`: `disclose_in_pr`, `assisted_by_trailer`, `human_written_description`, `human_written_replies`, `maintainer_approval_on_issue`, `label_pr=LABEL`.
    - If the policy lives in the organization's `.github` repository and covers all its projects, mark the org (`policy set owner ...`). A repository mark overrides an org mark.

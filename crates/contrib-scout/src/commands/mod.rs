@@ -29,14 +29,18 @@ use contrib_scout_core::gateway::{Budget, Gateway, HostPolicy};
 use contrib_scout_core::store::{SharedStore, Store};
 use contrib_scout_core::transport::{GhTransport, HttpTransport, Transport};
 use contrib_scout_core::{AgentId, Freshness, ScoutError};
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 /// Per-invocation context. Everything is resolved lazily so stubs and
 /// `config` never open the database.
 pub struct Context<'a> {
     pub cli: &'a Cli,
     pub now: DateTime<Utc>,
+    /// The store opened by [`Context::services`], if any: [`run`] copies its
+    /// shared quota snapshots into `meta.quota` after the command.
+    services_store: RefCell<Option<SharedStore>>,
 }
 
 #[allow(dead_code)] // helpers for the handlers filled in by later steps
@@ -119,6 +123,7 @@ impl Context<'_> {
             .with_coordinator(coordinator)
             .with_cache(store.clone())
             .with_lock_wait(config.lock_wait());
+        *self.services_store.borrow_mut() = Some(store.clone());
         Ok(Services {
             config,
             store,
@@ -128,7 +133,8 @@ impl Context<'_> {
 }
 
 /// What a network-capable command needs. Copy `gateway.metrics()` into
-/// `report.meta` (`requests`, `served_304`) before returning.
+/// `report.meta` (`requests`, `served_304`) before returning; `meta.quota`
+/// is filled by [`run`].
 #[allow(dead_code)] // consumed by the handlers filled in by later steps
 pub struct Services {
     pub config: Config,
@@ -140,6 +146,7 @@ pub fn run(cli: &Cli) -> Result<Report> {
     let mut ctx = Context {
         cli,
         now: Utc::now(),
+        services_store: RefCell::new(None),
     };
     let mut report = match &cli.command {
         Command::Discover(args) => discover::run(&mut ctx, args),
@@ -155,6 +162,14 @@ pub fn run(cli: &Cli) -> Result<Report> {
         Command::Cache(command) => cache::run(&mut ctx, command),
         Command::Config(command) => config::run(&mut ctx, command),
     }?;
+    // Every command that built `Services` reports the shared quota as it
+    // stands after its requests (`quota` fills it itself).
+    if let Some(store) = ctx.services_store.take() {
+        if report.meta.quota.is_empty() {
+            let store = store.lock().unwrap_or_else(PoisonError::into_inner);
+            report.meta.quota = store.quotas()?;
+        }
+    }
     if report.meta.as_of.is_none() {
         report.meta.as_of = Some(ctx.now);
     }

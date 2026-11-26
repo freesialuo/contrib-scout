@@ -75,7 +75,7 @@ contrib-scout --json policy files owner/repo
 
 #    ... then record your reading, with evidence.
 contrib-scout policy set owner/repo --stance disclose \
-  --evidence CONTRIBUTING.md:40-52 \
+  --evidence CONTRIBUTING.md:40-42 \
   --require disclose_in_pr --require assisted_by_trailer \
   --note "AI allowed if disclosed in the PR and commits carry Assisted-by"
 
@@ -121,7 +121,7 @@ Run `contrib-scout <command> --help` for full option details.
 | `policy due` | List marks whose review is due |
 
 - `--stance`: `bans`, `restricts`, `disclose`, `allows`, `welcomes`, `none_found` (for `none_found`, record the paths you checked as evidence).
-- `--evidence`: a repository path or an external URL, optionally with lines (`CONTRIBUTING.md:10-14`).
+- `--evidence`: a repository path or an external URL, optionally with lines (`CONTRIBUTING.md:10-12`). A line range covers at most 3 lines (the excerpt limit); quote the decisive lines, and give several `--evidence` flags for separate passages.
 - `--require`: `disclose_in_pr`, `assisted_by_trailer`, `human_written_description`, `human_written_replies`, `maintainer_approval_on_issue`, `label_pr=LABEL`.
 - `--scope K=V`: `code`, `pr_text`, `comments`, `autonomous_agents` take `unspecified`, `allowed`, `disclose`, `human_written`, or `forbidden`; `needs_prior_approval=true|false`; `forbidden_label=L` (same as `--forbid-label L`, for policies such as "no AI on good first issues"; matched ignoring case, `-`/`_` versus spaces, and extra whitespace, so `good-first-issue` matches `Good First Issue`).
 - An organization mark applies to all of its repositories; a repository mark overrides it.
@@ -224,7 +224,7 @@ The gate report (`data`) holds `verdict`, `blocked_by` (`{reason, detail}`), `ob
 
 - `meta.reminders` is filled by every command that touches a repository: `marked` (with stance, note, evidence links, `review_due`) or `unmarked` (with a `hint`). Human output prints the same as a warning line, for example `⚠ owner/repo: Bans AI — "No AI-generated contributions" (marked 2026-11-20)`.
 - `meta.partial` and `meta.warnings` say when some data could not be refreshed and came from the cache (stale) or is missing. Always check them.
-- `meta.requests` / `meta.served_304` count this invocation's requests; `meta.quota` is the last observed shared quota.
+- `meta.requests` / `meta.served_304` count this invocation's requests; `meta.quota` is the last observed shared quota (filled by every command that can reach the network, as it stands after the command's requests, and by `quota`; local-only commands leave it empty).
 - On failure, `data` is `null` and `error` carries `{code, message, exit_code}`.
 
 ### Exit codes

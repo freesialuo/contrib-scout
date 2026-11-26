@@ -329,6 +329,39 @@ fn candidates_on_an_empty_index_makes_zero_requests() {
 }
 
 #[test]
+fn network_commands_report_the_shared_quota() {
+    use contrib_scout_core::coordinator::{QuotaSnapshot, Resource};
+    let fixture = Fixture::new("meta-quota");
+    {
+        let mut store =
+            contrib_scout_core::store::Store::open(fixture.root.join("scout.db")).unwrap();
+        let now = chrono::Utc::now();
+        store
+            .record_quota(&QuotaSnapshot {
+                resource: Resource::Core,
+                limit: 5000,
+                remaining: 4321,
+                reset_at: now + chrono::TimeDelta::minutes(30),
+                observed_at: now,
+            })
+            .unwrap();
+    }
+    // `candidates` builds the network services but sends nothing here.
+    let output = fixture.run(&["--json", "candidates"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let envelope = envelope_of(&output);
+    assert_eq!(envelope["meta"]["requests"], 0);
+    let quota = envelope["meta"]["quota"].as_array().expect("meta.quota");
+    assert_eq!(quota.len(), 1, "{quota:?}");
+    assert_eq!(quota[0]["resource"], "core");
+    assert_eq!(quota[0]["remaining"], 4321);
+
+    // A local-only command does not open the network services.
+    let output = fixture.run(&["--json", "claim", "list"]);
+    assert_eq!(envelope_of(&output)["meta"]["quota"], serde_json::json!([]));
+}
+
+#[test]
 fn discover_explain_makes_no_requests() {
     let fixture = Fixture::new("explain");
     let output = fixture.run(&[
