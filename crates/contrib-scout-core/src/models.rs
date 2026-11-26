@@ -449,6 +449,18 @@ impl Default for Restriction {
     }
 }
 
+/// Canonical form of a GitHub label for comparisons: lowercase (Unicode),
+/// `-` and `_` read as spaces, surrounding space trimmed, inner runs of
+/// whitespace collapsed. `Good-First_Issue ` and `good  first issue` match.
+pub fn normalize_label(label: &str) -> String {
+    label
+        .to_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Which parts of a contribution the policy restricts, filled in by the agent.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

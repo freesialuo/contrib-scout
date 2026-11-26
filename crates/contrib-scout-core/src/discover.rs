@@ -31,7 +31,9 @@ use crate::error::{Result, ScoutError};
 use crate::freshness::Freshness;
 use crate::gateway::Gateway;
 use crate::index::{GitHubIndexer, IssueIndexer};
-use crate::models::{IssueRow, PolicyMark, Reminder, RepoActivity, RepoName, RepoProfile, Stance};
+use crate::models::{
+    normalize_label, IssueRow, PolicyMark, Reminder, RepoActivity, RepoName, RepoProfile, Stance,
+};
 use crate::policy::reminders::reminder_for;
 use crate::profile::{GitHubProfiler, RepoProfiler};
 use crate::store::repos::StoredIssueMark;
@@ -342,10 +344,6 @@ fn stops_run(error: &anyhow::Error) -> bool {
 
 fn is_not_found(error: &anyhow::Error) -> bool {
     matches!(ScoutError::find(error), Some(ScoutError::NotFound { .. }))
-}
-
-fn normalize_label(label: &str) -> String {
-    label.trim().to_ascii_lowercase().replace(['-', '_'], " ")
 }
 
 const BEGINNER_LABELS: &[&str] = &[

@@ -123,7 +123,7 @@ Run `contrib-scout <command> --help` for full option details.
 - `--stance`: `bans`, `restricts`, `disclose`, `allows`, `welcomes`, `none_found` (for `none_found`, record the paths you checked as evidence).
 - `--evidence`: a repository path or an external URL, optionally with lines (`CONTRIBUTING.md:10-14`).
 - `--require`: `disclose_in_pr`, `assisted_by_trailer`, `human_written_description`, `human_written_replies`, `maintainer_approval_on_issue`, `label_pr=LABEL`.
-- `--scope K=V`: `code`, `pr_text`, `comments`, `autonomous_agents` take `unspecified`, `allowed`, `disclose`, `human_written`, or `forbidden`; `needs_prior_approval=true|false`; `forbidden_label=L` (same as `--forbid-label L`, for policies such as "no AI on good first issues").
+- `--scope K=V`: `code`, `pr_text`, `comments`, `autonomous_agents` take `unspecified`, `allowed`, `disclose`, `human_written`, or `forbidden`; `needs_prior_approval=true|false`; `forbidden_label=L` (same as `--forbid-label L`, for policies such as "no AI on good first issues"; matched ignoring case, `-`/`_` versus spaces, and extra whitespace, so `good-first-issue` matches `Good First Issue`).
 - An organization mark applies to all of its repositories; a repository mark overrides it.
 - Default review periods: `bans` 90 days; `restricts`/`disclose` 30 days; `allows`/`welcomes`/`none_found` 14 days. Expired marks are never deleted or rewritten; their reminders gain `review_due: true`.
 

@@ -443,6 +443,24 @@ fn each_block_reason() {
 }
 
 #[test]
+fn forbidden_label_matches_normalised_spellings() {
+    for (label, forbidden) in [
+        ("good-first-issue", "Good First Issue"),
+        ("Good_First  Issue ", "good first issue"),
+        ("ÄRGER-Label", "ärger label"),
+    ] {
+        let h = harness();
+        put_mark(&h, |m| m.scope.forbidden_labels = vec![forbidden.into()]);
+        let spec = Spec {
+            labels: vec![label],
+            ..Spec::default()
+        };
+        let report = start(&h, &spec, "a1");
+        assert_eq!(reasons(&report), [BlockReason::ForbiddenLabel], "{label:?}");
+    }
+}
+
+#[test]
 fn skip_blocks_pr_too_and_shortlist_only_observes() {
     let h = harness();
     put_mark(&h, |_| {});

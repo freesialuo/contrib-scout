@@ -255,3 +255,11 @@ fn reminders() {
     assert_eq!(unmarked.kind, ReminderKind::Unmarked);
     assert!(unmarked.hint.unwrap().contains("policy files astral-sh/uv"));
 }
+
+#[test]
+fn labels_normalise_case_separators_and_spaces() {
+    use contrib_scout_core::models::normalize_label;
+    assert_eq!(normalize_label("  Good-First_Issue  "), "good first issue");
+    assert_eq!(normalize_label("good   first	issue"), "good first issue");
+    assert_eq!(normalize_label("ÄRGER"), "ärger");
+}

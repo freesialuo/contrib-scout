@@ -33,10 +33,10 @@ use crate::gateway::Gateway;
 use crate::index::{GitHubIndexer, IssueIndexer};
 use crate::issue_marks::{IssueMarkStatus, IssueVerdict};
 use crate::models::{
-    AgentId, BlockReason, Claim, ClaimOutcome, GateFinding, GateKind, GateObservation, GateRaw,
-    GateReport, GateVerdict, IssueDetail, IssueRef, IssueState, LinkedPr, ObservationKind,
-    ObservationSeverity, PolicyFile, PolicyMark, RepoName, RepoProfile, Requirement, Restriction,
-    Stance,
+    normalize_label, AgentId, BlockReason, Claim, ClaimOutcome, GateFinding, GateKind,
+    GateObservation, GateRaw, GateReport, GateVerdict, IssueDetail, IssueRef, IssueState, LinkedPr,
+    ObservationKind, ObservationSeverity, PolicyFile, PolicyMark, RepoName, RepoProfile,
+    Requirement, Restriction, Stance,
 };
 use crate::policy::files::graphql_data;
 use crate::policy::{GitHubPolicyFiles, PolicyFiles};
@@ -405,11 +405,12 @@ pub fn evaluate(
                 ));
             }
             for label in &row.labels {
+                let label_key = normalize_label(label);
                 if mark
                     .scope
                     .forbidden_labels
                     .iter()
-                    .any(|f| f.eq_ignore_ascii_case(label))
+                    .any(|f| normalize_label(f) == label_key)
                 {
                     block(
                         BlockReason::ForbiddenLabel,
