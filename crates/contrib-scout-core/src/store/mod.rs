@@ -7,11 +7,13 @@
 
 pub mod cache;
 pub mod claims;
+pub mod issue_marks;
 pub mod issues;
 pub mod policy;
 pub mod quota;
 pub mod repos;
 pub mod schema;
+pub mod tracked;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -24,8 +26,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use cache::{CacheStats, CachedResponse, DiscoverRun, PruneStats};
-pub use issues::{IssueFilter, SyncState};
+pub use issues::{IssueFilter, SaveStats, SyncState};
 pub use policy::CachedPolicyFile;
+pub use tracked::TrackedRepo;
 
 /// Services share one connection per process.
 pub type SharedStore = Arc<Mutex<Store>>;
