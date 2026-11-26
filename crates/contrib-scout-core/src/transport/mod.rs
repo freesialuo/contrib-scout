@@ -21,6 +21,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// `Accept` sent when [`ApiRequest::accept`] is `None`.
+pub const DEFAULT_ACCEPT: &str = "application/vnd.github+json";
+/// `X-GitHub-Api-Version` sent by the real transports.
+pub const API_VERSION: &str = "2022-11-28";
+
 /// A REST GET. `path` is relative to `https://api.github.com` (e.g.
 /// `/repos/o/r/issues?state=open`) or an absolute same-origin URL taken from a
 /// `Link` header; the gateway verifies the origin before sending.
