@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 pub use cache::{CacheStats, CachedResponse, DiscoverRun, PruneStats};
 pub use issues::{IssueFilter, SaveStats, SyncState};
-pub use policy::CachedPolicyFile;
+pub use policy::{CachedPolicyFile, POLICY_SNAPSHOT_PATH};
 pub use tracked::TrackedRepo;
 
 /// Services share one connection per process.

@@ -1,8 +1,31 @@
 //! Reminder construction (§5 steps 2-3). Every command that touches a
-//! repository calls [`reminder_for`] and adds the result to `meta.reminders`.
+//! repository calls [`repo_reminder`] (or [`reminder_for`] with a mark it
+//! already has) and adds the result to `meta.reminders`; human output prints
+//! [`human_line`] for each.
 
+use crate::error::Result;
 use crate::models::{PolicyMark, Reminder, ReminderKind, RepoName};
+use crate::store::Store;
 use chrono::{DateTime, Utc};
+
+/// The reminder for `repo` from the store: its own mark, else its org's,
+/// else `unmarked` with a hint. Zero requests.
+pub fn repo_reminder(store: &Store, repo: &RepoName, now: DateTime<Utc>) -> Result<Reminder> {
+    let mark = store.effective_mark(repo)?;
+    Ok(reminder_for(repo, mark.as_ref(), now))
+}
+
+/// [`repo_reminder`] for many repositories, in order.
+pub fn repo_reminders(
+    store: &Store,
+    repos: &[RepoName],
+    now: DateTime<Utc>,
+) -> Result<Vec<Reminder>> {
+    repos
+        .iter()
+        .map(|repo| repo_reminder(store, repo, now))
+        .collect()
+}
 
 /// `marked` (with `review_due` once expired) when a mark applies, else `unmarked` with a hint.
 pub fn reminder_for(repo: &RepoName, mark: Option<&PolicyMark>, now: DateTime<Utc>) -> Reminder {

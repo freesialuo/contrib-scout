@@ -6,9 +6,9 @@ pub mod files;
 pub mod marks;
 pub mod reminders;
 
-pub use files::{GitHubPolicyFiles, CANDIDATE_PATHS};
+pub use files::{AbsentPath, GitHubPolicyFiles, PolicyFetch, PolicySource, CANDIDATE_PATHS};
 pub use marks::{expires_at, StoreMarks};
-pub use reminders::{human_line, reminder_for};
+pub use reminders::{human_line, reminder_for, repo_reminder, repo_reminders};
 
 use crate::error::Result;
 use crate::freshness::{Freshness, Live, LiveRead};
