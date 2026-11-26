@@ -179,6 +179,33 @@ CREATE TABLE tracked_repos (
     added_by TEXT,
     added_at INTEGER NOT NULL
 );
+
+-- Agent-written issue marks (design §5b). `issue_ref` is `owner/repo#N`.
+CREATE TABLE issue_marks (
+    issue_ref TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    repo TEXT NOT NULL COLLATE NOCASE,
+    number INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    reason TEXT,
+    note TEXT NOT NULL,
+    seen_updated_at INTEGER,
+    seen_comments INTEGER,
+    marked_by TEXT NOT NULL,
+    marked_at INTEGER NOT NULL,
+    expires_at INTEGER
+);
+CREATE INDEX issue_marks_verdict ON issue_marks(verdict);
+CREATE INDEX issue_marks_repo ON issue_marks(repo);
+
+CREATE TABLE issue_mark_history (
+    id INTEGER PRIMARY KEY,
+    issue_ref TEXT NOT NULL COLLATE NOCASE,
+    action TEXT NOT NULL,
+    mark_json TEXT,
+    agent_id TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
+CREATE INDEX issue_mark_history_ref ON issue_mark_history(issue_ref, id);
 ";
 
 /// Applied in order; `PRAGMA user_version` and `meta.schema_version` record how many ran.
@@ -201,4 +228,6 @@ pub const TABLES: &[&str] = &[
     "gate_log",
     "discover_runs",
     "tracked_repos",
+    "issue_marks",
+    "issue_mark_history",
 ];

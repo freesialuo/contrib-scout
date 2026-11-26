@@ -21,10 +21,16 @@ use crate::args::{Cli, Command};
 use crate::render::Report;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use contrib_scout_core::config::{default_config_path, default_db_path, Config, ConfigFile};
-use contrib_scout_core::store::Store;
+use contrib_scout_core::config::{
+    default_config_path, default_db_path, Config, ConfigFile, TransportKind,
+};
+use contrib_scout_core::coordinator::SqliteCoordinator;
+use contrib_scout_core::gateway::{Budget, Gateway, HostPolicy};
+use contrib_scout_core::store::{SharedStore, Store};
+use contrib_scout_core::transport::{GhTransport, HttpTransport, Transport};
 use contrib_scout_core::{AgentId, Freshness, ScoutError};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Per-invocation context. Everything is resolved lazily so stubs and
 /// `config` never open the database.
@@ -77,6 +83,57 @@ impl Context<'_> {
     pub fn max_requests(&self, config: &Config) -> u32 {
         self.cli.max_requests.unwrap_or(config.max_requests)
     }
+
+    /// Agent id for request logging and quota attribution: `--agent` /
+    /// `CONTRIB_SCOUT_AGENT`, else `anonymous`. Commands that write claims or
+    /// marks must use [`Context::agent`] instead, which requires an id.
+    pub fn agent_or_anonymous(&self) -> AgentId {
+        self.cli
+            .agent
+            .clone()
+            .unwrap_or_else(|| "anonymous".parse().expect("valid agent id"))
+    }
+
+    /// Opens the shared store and builds the one outbound [`Gateway`] for this
+    /// invocation: configured transport, shared-quota coordinator, response
+    /// cache, per-invocation budget. Every command that talks to GitHub uses
+    /// this; nothing else may build its own transport (design §3, §9).
+    pub fn services(&self) -> Result<Services> {
+        let config = self.config()?;
+        let store = self.open_store()?.shared();
+        let transport: Arc<dyn Transport> = match config.transport {
+            TransportKind::Gh => Arc::new(GhTransport::new(&config.gh_path)),
+            TransportKind::Http => Arc::new(HttpTransport::new(None).with_gh(&config.gh_path)),
+        };
+        let coordinator = Arc::new(SqliteCoordinator::from_config(
+            store.clone(),
+            self.agent_or_anonymous(),
+            &config,
+        ));
+        let policy = HostPolicy {
+            rate_per_second: config.api_rate,
+            burst: config.api_burst,
+            ..HostPolicy::default()
+        };
+        let gateway = Gateway::new(transport, policy, Budget::new(self.max_requests(&config)))
+            .with_coordinator(coordinator)
+            .with_cache(store.clone())
+            .with_lock_wait(config.lock_wait());
+        Ok(Services {
+            config,
+            store,
+            gateway: Arc::new(gateway),
+        })
+    }
+}
+
+/// What a network-capable command needs. Copy `gateway.metrics()` into
+/// `report.meta` (`requests`, `served_304`) before returning.
+#[allow(dead_code)] // consumed by the handlers filled in by later steps
+pub struct Services {
+    pub config: Config,
+    pub store: SharedStore,
+    pub gateway: Arc<Gateway>,
 }
 
 pub fn run(cli: &Cli) -> Result<Report> {
