@@ -454,18 +454,24 @@ pub fn evaluate(
                     ));
                 }
             }
-            if kind == GateKind::Pr && mark.scope.requires_human() {
-                let mut why = Vec::new();
-                if mark.scope.pr_text == Restriction::HumanWritten {
-                    why.push("pr_text: human_written");
-                }
-                if mark.scope.autonomous_agents == Restriction::Forbidden {
-                    why.push("autonomous_agents: forbidden");
-                }
+            // `code: forbidden` means an AI agent cannot do the work at all, so
+            // it blocks `gate start` too (a `bans` stance already blocks).
+            let code_forbidden =
+                mark.scope.code == Restriction::Forbidden && mark.stance != Stance::Bans;
+            let why: Vec<&str> = match kind {
+                GateKind::Pr => mark
+                    .human_required_reasons()
+                    .into_iter()
+                    .filter(|r| *r != "code: forbidden" || code_forbidden)
+                    .collect(),
+                GateKind::Start if code_forbidden => vec!["code: forbidden"],
+                GateKind::Start => Vec::new(),
+            };
+            if !why.is_empty() {
                 block(
                     BlockReason::HumanRequired,
                     format!(
-                        "the mark on {} says {}; stop and hand the PR to a human",
+                        "the mark on {} says {}; stop and hand the work to a human",
                         mark.target,
                         why.join(", ")
                     ),

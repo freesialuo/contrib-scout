@@ -245,7 +245,7 @@ struct IssueMark {
 
 `GateReport` 包含**原始数据**：issue 正文、最近 N 条评论原文、timeline 中的 PR 链接、政策标记的提醒（note、证据摘录、永久链接），以及政策候选文件的当前原文。Agent 依据原文做判断，不依赖 CLI 的摘要。
 
-当标记里的 scope 包含 `pr_text: HumanWritten` 或 `autonomous_agents: Forbidden` 时，`gate pr` 的结论是 `blocked: human_required`。skill 规定 Agent 遇到这个结论必须停下，把工作交给人。
+当标记里的 scope 包含 `pr_text` 或 `comments` 为 `HumanWritten` / `Forbidden`、`autonomous_agents: Forbidden`、`code: Forbidden`，或 requirements 含 `HumanWrittenDescription` / `HumanWrittenReplies` 时，`gate pr` 的结论是 `blocked: human_required`。`code: Forbidden`（立场不是 Bans 时）在 `gate start` 也给出 `blocked: human_required`，因为 AI Agent 根本不能写代码。skill 规定 Agent 遇到这个结论必须停下，把工作交给人。
 
 ## 9. 多 Agent 协调
 

@@ -474,10 +474,34 @@ impl PolicyScope {
         "forbidden_label",
     ];
 
-    /// `gate pr` blocks with `human_required` when this holds (§8).
+    /// `gate pr` blocks with `human_required` when this holds (§8): the PR
+    /// text or the review replies must be written by a human (or must not
+    /// come from AI at all), autonomous agents are forbidden, or the code
+    /// itself must not be AI-written.
     pub fn requires_human(&self) -> bool {
-        self.pr_text == Restriction::HumanWritten
-            || self.autonomous_agents == Restriction::Forbidden
+        !self.human_required_reasons().is_empty()
+    }
+
+    /// The scope entries behind [`PolicyScope::requires_human`], as `key: value`.
+    pub fn human_required_reasons(&self) -> Vec<&'static str> {
+        let mut why = Vec::new();
+        if self.code == Restriction::Forbidden {
+            why.push("code: forbidden");
+        }
+        match self.pr_text {
+            Restriction::HumanWritten => why.push("pr_text: human_written"),
+            Restriction::Forbidden => why.push("pr_text: forbidden"),
+            _ => {}
+        }
+        match self.comments {
+            Restriction::HumanWritten => why.push("comments: human_written"),
+            Restriction::Forbidden => why.push("comments: forbidden"),
+            _ => {}
+        }
+        if self.autonomous_agents == Restriction::Forbidden {
+            why.push("autonomous_agents: forbidden");
+        }
+        why
     }
 
     /// Applies one `K=V` setting. `forbidden_label` appends.
@@ -756,6 +780,24 @@ pub struct PolicyMark {
 }
 
 impl PolicyMark {
+    /// Why `gate pr` must block with `human_required` (§8): the scope's
+    /// entries (see [`PolicyScope::human_required_reasons`]) plus the
+    /// `human_written_description` / `human_written_replies` requirements.
+    /// Empty when an agent may open the PR.
+    pub fn human_required_reasons(&self) -> Vec<&'static str> {
+        let mut why = self.scope.human_required_reasons();
+        for requirement in &self.requirements {
+            match requirement {
+                Requirement::HumanWrittenDescription => {
+                    why.push("requirement: human_written_description")
+                }
+                Requirement::HumanWrittenReplies => why.push("requirement: human_written_replies"),
+                _ => {}
+            }
+        }
+        why
+    }
+
     /// Format checks only (§5 step 5): evidence present, note present, short excerpts.
     pub fn validate(&self) -> Result<(), ParseError> {
         let target = self.target.key();

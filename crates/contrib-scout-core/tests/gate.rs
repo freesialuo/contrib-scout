@@ -585,6 +585,68 @@ fn pr_blocks_on_human_required_and_missing_approval() {
 }
 
 #[test]
+fn pr_blocks_on_every_human_only_mark() {
+    type Edit = fn(&mut PolicyMark);
+    let cases: [(Edit, &str); 6] = [
+        (
+            |m| m.scope.pr_text = Restriction::Forbidden,
+            "pr_text: forbidden",
+        ),
+        (
+            |m| m.scope.comments = Restriction::HumanWritten,
+            "comments: human_written",
+        ),
+        (
+            |m| m.scope.comments = Restriction::Forbidden,
+            "comments: forbidden",
+        ),
+        (
+            |m| m.requirements.push(Requirement::HumanWrittenDescription),
+            "requirement: human_written_description",
+        ),
+        (
+            |m| m.requirements.push(Requirement::HumanWrittenReplies),
+            "requirement: human_written_replies",
+        ),
+        (
+            |m| m.scope.code = Restriction::HumanWritten,
+            "code: human_written",
+        ),
+    ];
+    for (i, (edit, why)) in cases.into_iter().enumerate() {
+        let h = harness();
+        put_mark(&h, |_| {});
+        assert_eq!(start(&h, &Spec::default(), "a1").verdict, GateVerdict::Pass);
+        put_mark(&h, edit);
+        let report = pr(&h, &Spec::default(), "a1", &PrOptions::default());
+        if i == 5 {
+            // code: human_written alone is not an AI-only restriction of the PR.
+            assert_eq!(report.verdict, GateVerdict::Pass, "{why}");
+            continue;
+        }
+        assert_eq!(reasons(&report), [BlockReason::HumanRequired], "{why}");
+        assert!(report.blocked_by[0].detail.contains(why), "{why}");
+    }
+}
+
+#[test]
+fn code_forbidden_blocks_start_and_pr_with_human_required() {
+    let h = harness();
+    put_mark(&h, |m| m.scope.code = Restriction::Forbidden);
+    let report = start(&h, &Spec::default(), "a1");
+    assert_eq!(reasons(&report), [BlockReason::HumanRequired]);
+    assert!(report.blocked_by[0].detail.contains("code: forbidden"));
+
+    // A bans stance already says it; no second reason.
+    put_mark(&h, |m| {
+        m.stance = Stance::Bans;
+        m.scope.code = Restriction::Forbidden;
+    });
+    let report = start(&h, &Spec::default(), "a1");
+    assert_eq!(reasons(&report), [BlockReason::PolicyBans]);
+}
+
+#[test]
 fn network_down_fails_closed_even_with_a_warm_cache() {
     let h = harness();
     put_mark(&h, |_| {});
