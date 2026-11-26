@@ -132,19 +132,21 @@ impl Store {
         Ok(names)
     }
 
-    /// Cross-process exclusive lock on `scope` (a sibling `.lock` file named by
-    /// a stable hash). Returns `Ok(None)` if not acquired within `max_wait`.
-    /// In-memory stores always succeed. Basis for single-flight (§9).
+    /// Cross-process exclusive lock on `scope`. Returns `Ok(None)` if not
+    /// acquired within `max_wait`. In-memory stores always succeed. Basis for
+    /// single-flight (§9).
+    ///
+    /// Scopes map onto a fixed pool of [`SCOPE_LOCK_SLOTS`] sibling files
+    /// (`<db>.scope-NN.lock`, by a stable hash), so lock files do not pile up
+    /// with every URL ever fetched. Two scopes may share a file: that only
+    /// serializes them. Callers never hold one scope lock while taking
+    /// another, so sharing cannot deadlock.
     pub fn lock_scope(&self, scope: &str, max_wait: Duration) -> Result<Option<ScopeLock>> {
         let Some(path) = &self.path else {
             return Ok(Some(ScopeLock { _file: None }));
         };
-        // FNV-1a: stable across processes, and keeps URLs out of file names.
-        let hash = scope.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        });
         let mut name = path.as_os_str().to_owned();
-        name.push(format!(".scope-{hash:016x}.lock"));
+        name.push(format!(".scope-{:02}.lock", scope_slot(scope)));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -170,6 +172,18 @@ impl Store {
             }
         }
     }
+}
+
+/// Number of lock files [`Store::lock_scope`] spreads scopes over.
+pub const SCOPE_LOCK_SLOTS: u64 = 64;
+
+/// The pool slot of `scope`: FNV-1a (stable across processes, keeps URLs
+/// out of file names) modulo [`SCOPE_LOCK_SLOTS`].
+pub fn scope_slot(scope: &str) -> u64 {
+    let hash = scope.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    hash % SCOPE_LOCK_SLOTS
 }
 
 /// Unix seconds → UTC.

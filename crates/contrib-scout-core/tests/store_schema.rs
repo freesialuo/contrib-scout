@@ -42,3 +42,45 @@ fn file_store_reopens_without_remigrating() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn scope_locks_share_a_fixed_pool_of_files() {
+    use contrib_scout_core::store::{scope_slot, SCOPE_LOCK_SLOTS};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "scope-pool-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    ));
+    let store = Store::open(dir.join("scout.db")).unwrap();
+    for i in 0..500 {
+        let guard = store
+            .lock_scope(
+                &format!("flight:https://api.github.com/repos/o/r/issues/{i}"),
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert!(guard.is_some());
+    }
+    let locks = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lock"))
+        .count();
+    assert!(
+        locks > 1 && locks as u64 <= SCOPE_LOCK_SLOTS,
+        "{locks} lock files"
+    );
+
+    // Two scopes in one slot serialize: the second waits for the first.
+    let a = "flight:a";
+    let b = (0..)
+        .map(|i| format!("flight:b{i}"))
+        .find(|b| scope_slot(b) == scope_slot(a))
+        .unwrap();
+    let other = Store::open(dir.join("scout.db")).unwrap();
+    let held = store.lock_scope(a, Duration::ZERO).unwrap();
+    assert!(held.is_some());
+    assert!(other.lock_scope(&b, Duration::ZERO).unwrap().is_none());
+    drop(held);
+    assert!(other.lock_scope(&b, Duration::ZERO).unwrap().is_some());
+}
