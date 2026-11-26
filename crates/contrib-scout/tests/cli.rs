@@ -95,24 +95,95 @@ fn every_command_has_help() {
 }
 
 #[test]
-fn stubs_return_a_json_error_envelope() {
-    let fixture = Fixture::new("stub");
-    let stubs: &[&[&str]] = &[
+fn gates_require_an_agent_and_refuse_offline() {
+    let fixture = Fixture::new("gate-usage");
+    let usage: &[&[&str]] = &[
         &["--json", "gate", "start", "https://github.com/a/b/issues/1"],
         &["--json", "gate", "pr", "a/b#1", "--branch", "x"],
-        &["--json", "claim", "list"],
+        &[
+            "--json",
+            "--agent",
+            "a1",
+            "gate",
+            "pr",
+            "a/b#1",
+            "--approval-url",
+            "http://example.com",
+        ],
+        &["--json", "claim", "renew", "a/b#1"],
+        &["--json", "claim", "release", "a/b#1"],
     ];
-    for args in stubs {
+    for args in usage {
         let output = fixture.run(args);
-        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
         let envelope: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
         assert_eq!(envelope["schema"], "contrib-scout/v1", "{args:?}");
-        assert_eq!(envelope["error"]["code"], "not_implemented", "{args:?}");
-        assert!(envelope["meta"]["as_of"].is_string());
+        assert_eq!(envelope["error"]["code"], "usage", "{args:?}");
     }
-    let human = fixture.run(&["claim", "list"]);
-    assert_eq!(human.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&human.stderr).contains("not implemented"));
+    let output = fixture.run(&[
+        "--json",
+        "--agent",
+        "a1",
+        "--offline",
+        "gate",
+        "start",
+        "a/b#1",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let envelope: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(envelope["error"]["code"], "live_required");
+}
+
+#[test]
+fn claim_list_renew_release_round_trip() {
+    use contrib_scout_core::store::Store;
+    let fixture = Fixture::new("claims");
+    {
+        let mut store = Store::open(fixture.root.join("scout.db")).unwrap();
+        let now = chrono::Utc::now();
+        let issue = "a/b#1".parse().unwrap();
+        let agent = "a1".parse().unwrap();
+        store
+            .claim_issue(&issue, &agent, now, now + chrono::TimeDelta::hours(1), None)
+            .unwrap();
+    }
+
+    let output = fixture.run(&["--json", "claim", "list"]);
+    assert!(output.status.success(), "{output:?}");
+    let envelope = json(&output);
+    assert_eq!(envelope["data"][0]["issue"], "a/b#1");
+    assert_eq!(envelope["data"][0]["agent"], "a1");
+    assert_eq!(envelope["meta"]["reminders"][0]["kind"], "unmarked");
+    let output = fixture.run(&["--json", "--agent", "a2", "claim", "list"]);
+    assert_eq!(json(&output)["data"], serde_json::json!([]));
+    let output = fixture.run(&["--json", "--agent", "a2", "claim", "list", "--all"]);
+    assert_eq!(json(&output)["data"].as_array().unwrap().len(), 1);
+
+    let output = fixture.run(&["--json", "--agent", "a2", "claim", "renew", "a/b#1"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(json(&output)["error"]["code"], "not_found");
+    let before = json(&fixture.run(&["--json", "claim", "list"]))["data"][0]["lease_until"].clone();
+    let output = fixture.run(&["--json", "--agent", "a1", "claim", "renew", "a/b#1"]);
+    assert!(output.status.success(), "{output:?}");
+    let envelope = json(&output);
+    assert_eq!(envelope["data"]["claim"]["agent"], "a1");
+    assert_ne!(envelope["data"]["claim"]["lease_until"], before);
+    let kinds: Vec<_> = envelope["meta"]["reminders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(kinds, ["unmarked"]);
+
+    let output = fixture.run(&["--agent", "a1", "claim", "list"]);
+    assert!(stdout(&output).contains("a/b#1  a1  until "), "{output:?}");
+    let output = fixture.run(&["--json", "--agent", "a1", "claim", "release", "a/b#1"]);
+    assert_eq!(json(&output)["data"]["released"], true);
+    let output = fixture.run(&["--agent", "a1", "claim", "release", "a/b#1"]);
+    assert!(stdout(&output).contains("You held no active claim on a/b#1"));
+    let output = fixture.run(&["claim", "list"]);
+    assert!(stdout(&output).contains("No active claims"), "{output:?}");
 }
 
 #[test]

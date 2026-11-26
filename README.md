@@ -142,15 +142,21 @@ Skip reasons: `too_large`, `unclear`, `needs_special_env`, `out_of_scope`, `dupl
 
 | Command | Description |
 |---|---|
-| `gate start <ref> [--agent ID]` | Live checks before starting work; acquires or renews your local claim |
-| `gate pr <ref> [--agent ID] [--branch B]` | Live checks before opening a PR; returns the full current policy text, PR template, and PR requirements. `--branch` excludes your own PR head from the linked-PR check |
-| `claim list` | List active claims |
-| `claim renew <ref>` | Extend your lease (default 48h) |
-| `claim release <ref>` | Release your claim |
+| `gate start <ref> --agent ID` | Live checks before starting work; on `pass`, acquires or renews your local claim |
+| `gate pr <ref> --agent ID [--branch B] [--approval-url URL]` | Live checks before opening a PR; returns the full current policy text, PR template, PR requirements, and a checklist. `--branch` excludes your own PR from the linked-PR check and is recorded on your claim; `--approval-url` points to the maintainer's approval when the mark requires one |
+| `claim list [--all]` | List active claims (only yours when `--agent` is set, unless `--all`) |
+| `claim renew <ref> --agent ID` | Extend your lease (`claim_lease`, default 48h) |
+| `claim release <ref> --agent ID` | Release your claim |
 
-Both gates check live: the issue is open, not marked `skip`, not assigned to someone else, has no linked PR from someone else, the repository is not archived, a policy mark exists and is not `bans`, and the issue's labels are not in the mark's forbidden labels. They report, without judging, comment-based claims and prior-approval evidence. `gate pr` additionally requires that you hold the claim.
+Gates require an agent id (`--agent` or `CONTRIB_SCOUT_AGENT`; missing is a usage error, exit 2). Both gates check live: the issue is open, not marked `skip`, not assigned to someone other than the authenticated GitHub user, has no open or merged linked PR (closed-unmerged PRs are only reported), the repository is not archived, a policy mark exists and is not `bans`, and the issue's labels are not in the mark's forbidden labels. `gate start` blocks when another agent holds the claim; `gate pr` requires that you hold it.
 
-The verdict is `pass`, `blocked` (with reasons such as `policy_unmarked`, `policy_bans`, `issue_skipped`, `claimed_by_other`, `pr_exists`, `human_required`), or `error` (network or quota trouble; fail closed). `gate pr` returns `blocked: human_required` when the mark's scope says PR text must be human-written or autonomous agents are forbidden. Gates refuse `--offline` and never fall back to the cache; a `304 Not Modified` counts as a live confirmation.
+Report-only `observations` (`{kind, severity, detail, url}`, severity `info` or `warning`, never blocking): comments that look like someone taking the issue (`comment_claim`, a phrase heuristic), the issue assigned to you (`assigned_to_you`), maintainer comments to read for approval (`approval_evidence`), your own excluded PR (`own_pr_excluded`), closed linked PRs, non-blocking issue marks, a mark past its review date, and truncated policy files.
+
+When the mark requires maintainer approval (`--scope needs_prior_approval=true` or `--require maintainer_approval_on_issue`), `gate start` reports it and `gate pr` blocks with `approval_missing` until you pass `--approval-url URL` (an `https` link to the approval; the CLI records it but does not verify it). Your own PR is excluded only with `--branch`: a linked PR is yours when its author is the authenticated GitHub user and its head branch (read live, at most 5 lookups) equals `--branch`. The login comes from one live `GET /user` per gate and is never cached; gates therefore need an authenticated `gh`/token.
+
+The verdict is `pass` (exit 0), `blocked` (exit 20; reasons `policy_unmarked`, `policy_bans`, `issue_skipped`, `issue_closed`, `assigned_to_other`, `pr_exists`, `repo_archived`, `forbidden_label`, `claimed_by_other`, `claim_not_held`, `approval_missing`, `human_required`), or `error` (exit 1: network or quota trouble, fail closed; the envelope has `data: null` and `error.code`, for example `network_unavailable`). `gate pr` returns `blocked: human_required` when the mark's scope says `pr_text: human_written` or `autonomous_agents: forbidden`. Every gate run, errors included, is appended to `gate_log`. Gates refuse `--offline` and never fall back to the cache; a `304 Not Modified` counts as a live confirmation.
+
+The gate report (`data`) holds `verdict`, `blocked_by` (`{reason, detail}`), `observations`, `requirements` (from the mark: a preview on `start`), `checklist` (`gate pr` only: requirements, restricted scope, approval, and every policy file to read or PR template to follow), `claim`, `viewer`, and `raw`: the issue body, the last `gate_comments` comments verbatim, timeline-linked PRs, the repository, the policy mark (note, evidence excerpts, pinned URLs), the issue mark, and the policy files (`gate start`: list only; `gate pr`: full current text). A gate costs a bounded number of requests: `GET /user`, the repository, the issue with up to two comment pages and its timeline pages, one `commits/HEAD` check per policy source (GraphQL only when a HEAD moved), and on `gate pr --branch` up to 5 PR lookups.
 
 ### Index, tracking, and maintenance
 

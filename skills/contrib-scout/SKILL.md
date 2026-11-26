@@ -69,24 +69,27 @@ Every command that touches a repository returns `meta.reminders`. Read them befo
    ```sh
    contrib-scout --json --agent ID gate start 'owner/repo#123'
    ```
-   Exit `0` / `verdict: "pass"`: you now hold a local claim (lease, renew with `claim renew`). Read the returned raw data (issue body, recent comments, linked PRs, mark, policy file list) and `observations` (such as someone claiming the issue in a comment, or approval evidence) yourself.
+   Exit `0` / `verdict: "pass"`: you now hold a local claim (lease, renew with `claim renew`). Read the returned raw data (`raw.issue` body, recent comments, linked PRs; `raw.policy_mark`; the policy file list) and `observations` yourself. Observations never block, but act on them: `comment_claim` means a comment looks like someone taking the issue (a phrase heuristic; read it and back off if they are on it), `approval_required` means `gate pr` will need `--approval-url`, `mark_review_due` means re-read the policy and re-mark. `requirements` previews what the PR must do.
    Exit `20` / `verdict: "blocked"`: stop and act on `blocked_by`:
    - `policy_unmarked` → do step 2, then gate again.
    - `policy_bans` → drop the repository.
    - `issue_skipped` → another agent ruled it out; read the mark's reason. Only `issue unmark` if you have a concrete reason the verdict is wrong.
    - `forbidden_label` → the policy forbids AI on this kind of issue; drop it.
    - `claimed_by_other`, `assigned_to_other`, `pr_exists`, `issue_closed`, `repo_archived` → pick another issue.
-   Exit `1` / `verdict: "error"`: the live check failed (network or quota). Do not start; retry later, never with `--offline`.
+   A blocked `gate start` does not take a claim.
+   Exit `1` (`data: null`, `error.code` such as `network_unavailable` or `quota_reserved`): the live check failed and the gate failed closed (logged as verdict `error`). Do not start; retry later, never with `--offline`.
 
 5. **Gate before opening a PR.**
    ```sh
-   contrib-scout --json --agent ID gate pr 'owner/repo#123' --branch my-branch
+   contrib-scout --json --agent ID gate pr 'owner/repo#123' --branch my-branch [--approval-url URL]
    ```
+   Always pass `--branch` once your PR branch exists: your own linked PR (authored by the authenticated GitHub user, head branch equal to `--branch`) is then excluded from `pr_exists`, and the branch is recorded on your claim.
    - **Read the returned live contribution rules and the PR template in full.** They are the real gate. If they differ from the mark (new ban, new requirement, changed scope), stop, update the mark with `policy set`, and re-evaluate before going on.
-   - Obey every item in `requirements`: disclose AI use in the PR description, add `Assisted-by:` trailers to commits, keep the description and replies human-written, get maintainer approval first, apply required labels, follow the PR template.
+   - Work through `checklist` and obey every item in `requirements`: disclose AI use in the PR description, add `Assisted-by:` trailers to commits, keep the description and replies human-written, get maintainer approval first, apply required labels, follow the PR template.
    - `blocked: human_required` → **stop and hand the work to the human**: the PR text must be written by a person, or autonomous agents are not allowed. Give them the branch, a summary, and the requirements; do not draft the PR text for them to paste unless they ask, and never open the PR yourself.
    - `claim_not_held` → run `gate start` again first.
-   - `approval_missing` → maintainer approval is required and none was found; ask in the issue only if the human agrees, or stop.
+   - Any reason from step 4 (`issue_skipped`, `pr_exists`, `claimed_by_other`, …) → handle it as in step 4.
+   - `approval_missing` → the mark requires maintainer approval. Read the `approval_evidence` comments; if a maintainer clearly approved, gate again with `--approval-url <that comment's URL>` (the CLI records it, it does not verify it). Otherwise ask in the issue only if the human agrees, or stop.
    - Opening the PR is a separate action that the user must approve; `gate pr` only checks.
 
 6. **Release what you will not finish:** `contrib-scout --json --agent ID claim release 'owner/repo#123'`, and leave a `skip` or `shortlist` mark with what you learned.

@@ -216,4 +216,20 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Logged gate reports for `issue` (or all), oldest first, from their snapshots.
+    pub fn gate_reports(&self, issue: Option<&IssueRef>) -> Result<Vec<GateReport>> {
+        let mut statement = self.conn.prepare(
+            "SELECT snapshot_json FROM gate_log
+             WHERE (?1 IS NULL OR issue_ref = ?1) ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![issue.map(ToString::to_string)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            .map(|json| serde_json::from_str(json).context("stored gate report"))
+            .collect()
+    }
 }

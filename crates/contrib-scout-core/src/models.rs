@@ -1044,6 +1044,8 @@ open_enum! {
         ForbiddenLabel => "forbidden_label",
         /// Prior maintainer approval is required and none was found (`gate pr` only).
         ApprovalMissing => "approval_missing",
+        /// The issue carries an active agent-written `skip` mark (§5b).
+        IssueSkipped => "issue_skipped",
     }
 }
 
@@ -1054,13 +1056,62 @@ pub struct GateFinding {
     pub detail: String,
 }
 
+open_enum! {
+    /// How much attention a report-only gate observation deserves. Never blocks.
+    ObservationSeverity, "observation severity" {
+        Info => "info",
+        Warning => "warning",
+    }
+}
+
+open_enum! {
+    /// What a report-only gate observation is about (§8: heuristics are reported, not judged).
+    ObservationKind, "observation kind" {
+        /// A recent comment reads like someone claiming the work (heuristic).
+        CommentClaim => "comment_claim",
+        /// The issue is assigned to the authenticated GitHub user.
+        AssignedToYou => "assigned_to_you",
+        /// The mark says maintainer approval is needed before work or a PR.
+        ApprovalRequired => "approval_required",
+        /// A maintainer comment the agent should read for approval.
+        ApprovalEvidence => "approval_evidence",
+        /// The approval URL the agent supplied with `--approval-url`.
+        ApprovalUrl => "approval_url",
+        /// A linked PR that is the agent's own `--branch`, excluded from `pr_exists`.
+        OwnPrExcluded => "own_pr_excluded",
+        /// A linked PR that was closed without merging; not blocking.
+        ClosedPr => "closed_pr",
+        /// The policy mark is past its review date.
+        MarkReviewDue => "mark_review_due",
+        /// An issue mark that does not block (shortlist, or an expired skip).
+        IssueMark => "issue_mark",
+        /// A policy file whose text was truncated.
+        PolicyFileTruncated => "policy_file_truncated",
+    }
+}
+
+/// A report-only gate observation (`severity` is `info` or `warning`; it never blocks).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateObservation {
+    pub kind: ObservationKind,
+    pub severity: ObservationSeverity,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// Raw, live GitHub data handed to the agent; the agent decides from this,
 /// not from the CLI's summary (§8).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GateRaw {
+    /// Body, the last `gate_comments` comments verbatim, and timeline-linked PRs.
     pub issue: Option<IssueDetail>,
     pub repo: Option<RepoProfile>,
+    /// The effective policy mark: note, scope, requirements, evidence excerpts and pinned URLs.
     pub policy_mark: Option<PolicyMark>,
+    /// The agent-written issue mark, if any (§5b).
+    #[serde(default)]
+    pub issue_mark: Option<crate::issue_marks::IssueMark>,
     /// `gate start`: list only (`text` is `None`); `gate pr`: full text.
     #[serde(default)]
     pub policy_files: Vec<PolicyFile>,
@@ -1074,14 +1125,27 @@ pub struct GateReport {
     pub verdict: GateVerdict,
     #[serde(default)]
     pub blocked_by: Vec<GateFinding>,
-    /// Report-only heuristics: comment-based claims, approval evidence, CLA/DCO (§8, §11.4).
+    /// Report-only heuristics: comment-based claims, approval evidence, own PRs (§8, §11.4).
     #[serde(default)]
-    pub observations: Vec<String>,
-    /// PR requirements: a preview on `start`, the full list on `pr`.
+    pub observations: Vec<GateObservation>,
+    /// PR requirements from the mark: a preview on `start`, the full list on `pr`.
     #[serde(default)]
     pub requirements: Vec<Requirement>,
+    /// `gate pr` only: every requirement, restricted scope, approval, and policy
+    /// file to read, as one checklist line each.
+    #[serde(default)]
+    pub checklist: Vec<String>,
     #[serde(default)]
     pub claim: Option<Claim>,
+    /// The authenticated GitHub login (one live `GET /user`, never cached).
+    #[serde(default)]
+    pub viewer: Option<String>,
+    /// `gate pr --approval-url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_url: Option<String>,
+    /// Set when `verdict` is `error` (only in `gate_log`; the CLI exits 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub raw: GateRaw,
     pub as_of: DateTime<Utc>,
 }
