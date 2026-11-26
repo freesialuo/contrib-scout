@@ -20,14 +20,14 @@
 //!   the `since` it was asked with, e.g. more than a page of items share one
 //!   timestamp) is its `Link: rel="next"` page followed instead; such a pass
 //!   can skip items again, so its watermark never advances past the one the
-//!   pass started from.
+//!   pass started from (on a first pass: the `since` of that request).
 //! - Because every keyset page is a prefix in ascending `updated_at` order,
 //!   after any page every item updated before the largest `updated_at` seen so
 //!   far is stored. An interrupted pass therefore checkpoints `since = max
 //!   updated_at seen` (never moving backwards) and is marked `partial`; the
 //!   next run resumes from there and ignores the TTL.
 //! - A completed pass sets the watermark to the time its earliest run
-//!   *started* (local clock). Anything updated while the pass was running, or
+//!   *started* (local clock), unless it had to follow `Link` pages (above). Anything updated while the pass was running, or
 //!   while it was interrupted, is newer than that and is listed again by the
 //!   next pass; `index_overlap` (default 10m) absorbs clock skew between this
 //!   machine and GitHub. Using the start time rather than the newest
