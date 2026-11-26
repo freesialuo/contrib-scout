@@ -2,19 +2,30 @@
 //!
 //! # Sync
 //! One pass lists `GET /repos/{o}/{r}/issues?sort=updated&direction=asc&per_page=100`
-//! and follows `Link: rel="next"` pages until the end or until the request
-//! budget / shared quota / network stops it. PRs (items with a `pull_request`
-//! key) are skipped. Only index fields are stored; bodies are fetched on demand.
+//! until the end or until the request budget / shared quota / network stops
+//! it. PRs (items with a `pull_request` key) are skipped. Only index fields
+//! are stored; bodies are fetched on demand.
 //!
 //! - The first pass of a repository lists `state=open` without `since` (no full
 //!   history scan of large repositories, §1). Later passes list `state=all` with
 //!   `since = watermark - index_overlap`, so closures and edits are picked up.
-//! - Pages are read in ascending `updated_at` order, so after any page every
-//!   item updated at or before the largest `updated_at` seen so far is stored.
-//!   An interrupted pass therefore checkpoints `since = max updated_at seen`
-//!   (never moving backwards) and is marked `partial`; the next run resumes from
-//!   there and ignores the TTL. Page cursors are not reused: GitHub's page
-//!   numbers shift while issues are being updated, the watermark does not.
+//! - Paging is keyset-style, not by page number. Page numbers over
+//!   `sort=updated` shift while the pass runs: an item updated mid-pass moves to
+//!   the end, every later item moves one slot up, and the item that slid onto an
+//!   already-read page would be skipped for good. So after each page the next
+//!   request is page 1 again with `since = max updated_at seen` (inclusive, so
+//!   items at that exact time come back and are deduplicated by number and
+//!   `updated_at`). A page-1 answer is always a consistent prefix of the
+//!   remaining items. Only when a page makes no progress (no item newer than
+//!   the `since` it was asked with, e.g. more than a page of items share one
+//!   timestamp) is its `Link: rel="next"` page followed instead; such a pass
+//!   can skip items again, so its watermark never advances past the one the
+//!   pass started from.
+//! - Because every keyset page is a prefix in ascending `updated_at` order,
+//!   after any page every item updated before the largest `updated_at` seen so
+//!   far is stored. An interrupted pass therefore checkpoints `since = max
+//!   updated_at seen` (never moving backwards) and is marked `partial`; the
+//!   next run resumes from there and ignores the TTL.
 //! - A completed pass sets the watermark to the time its earliest run
 //!   *started* (local clock). Anything updated while the pass was running, or
 //!   while it was interrupted, is newer than that and is listed again by the
@@ -382,20 +393,28 @@ impl GitHubIndexer {
             .pass_started_at
             .filter(|_| state.partial)
             .unwrap_or(started);
-        let mut url = format!(
+        let base = format!(
             "/repos/{}/{}/issues?state={}&sort=updated&direction=asc&per_page=100",
             repo.owner(),
             repo.name(),
             if first_pass { "open" } else { "all" }
         );
-        if let Some(since) = since {
-            url.push_str(&format!("&since={}", github_time(since)));
-        }
+        let keyed = |since: Option<DateTime<Utc>>| match since {
+            Some(since) => format!("{base}&since={}", github_time(since)),
+            None => base.clone(),
+        };
 
         let requests_before = self.gateway.metrics().requests;
         let mut watermark = state.since;
+        // Set once a page made no progress and its `Link` page was followed:
+        // page numbers can skip items, so the watermark stays at the pass's
+        // starting one (or the `since` of that request when there was none).
+        let mut capped: Option<Option<DateTime<Utc>>> = None;
+        let mut cursor = since;
+        // Issue number -> `updated_at` already stored by this pass.
+        let mut seen: BTreeMap<u64, DateTime<Utc>> = BTreeMap::new();
         let mut visited = BTreeSet::new();
-        let mut next = Some(url);
+        let mut next = Some(keyed(cursor));
         let mut complete = false;
         while let Some(url) = next.take() {
             if url.starts_with("https://") && !safe_api_url(&url, "/issues") {
@@ -434,9 +453,17 @@ impl GitHubIndexer {
                 .with_context(|| format!("issue listing of {repo}"))?;
             let fetched_at = Utc::now();
             let mut rows = Vec::new();
+            let mut page_max: Option<DateTime<Utc>> = None;
             for item in &items {
-                if let Some(updated) = parse_time(&item["updated_at"]) {
-                    watermark = Some(watermark.map_or(updated, |w| w.max(updated)));
+                let updated = parse_time(&item["updated_at"]);
+                if let Some(updated) = updated {
+                    page_max = Some(page_max.map_or(updated, |m| m.max(updated)));
+                }
+                // `since` is inclusive: skip what this pass already stored.
+                if let (Some(number), Some(updated)) = (item["number"].as_u64(), updated) {
+                    if seen.insert(number, updated) == Some(updated) {
+                        continue;
+                    }
                 }
                 if item.get("pull_request").is_some() {
                     report.skipped_prs += 1;
@@ -444,13 +471,27 @@ impl GitHubIndexer {
                 }
                 rows.push((parse_issue_row(repo, item, fetched_at)?, item.clone()));
             }
+            if let Some(max) = page_max {
+                watermark = Some(watermark.map_or(max, |w| w.max(max)));
+            }
             report.pages += 1;
-            next = response
-                .header_value("link")
-                .and_then(next_link)
-                .map(str::to_owned);
+            next = match response.header_value("link").and_then(next_link) {
+                None => None,
+                Some(link) => match page_max {
+                    // Progress: restart at page 1 from the newest time seen.
+                    Some(max) if cursor.is_none_or(|c| max > c) => {
+                        cursor = Some(max);
+                        Some(keyed(cursor))
+                    }
+                    // A full page at one timestamp: only page numbers move on.
+                    _ => {
+                        capped.get_or_insert(state.since.or(cursor));
+                        Some(link.to_owned())
+                    }
+                },
+            };
             let checkpoint = SyncState {
-                since: watermark,
+                since: capped.unwrap_or(watermark),
                 last_full_at: state.last_full_at,
                 last_sync_at: state.last_sync_at,
                 partial: true,
@@ -474,7 +515,7 @@ impl GitHubIndexer {
 
         let final_state = if complete {
             SyncState {
-                since: Some(pass_started),
+                since: capped.unwrap_or(Some(pass_started)),
                 last_full_at: if first_pass {
                     Some(started)
                 } else {
@@ -487,7 +528,7 @@ impl GitHubIndexer {
         } else {
             report.partial = true;
             SyncState {
-                since: watermark,
+                since: capped.unwrap_or(watermark),
                 last_full_at: state.last_full_at,
                 last_sync_at: Some(started),
                 partial: true,

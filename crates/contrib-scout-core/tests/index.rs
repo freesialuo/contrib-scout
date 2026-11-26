@@ -110,8 +110,19 @@ fn first_sync_paginates_skips_prs_and_stores() {
             Some(second),
         ),
     );
-    h.fixture
-        .expect_get(second, page(vec![issue(3, at(3, 0), "open", 4)], None));
+    // Keyset paging: page 1 again, from the newest `updated_at` seen; the
+    // inclusive `since` returns the PR at 02:00 again, which is not recounted.
+    h.fixture.expect_get(
+        format!("{FIRST}&since=2026-11-20T02:00:00Z"),
+        page(
+            vec![pull(2, at(2, 0)), issue(3, at(3, 0), "open", 4)],
+            Some(second),
+        ),
+    );
+    h.fixture.expect_get(
+        format!("{FIRST}&since=2026-11-20T03:00:00Z"),
+        page(vec![issue(3, at(3, 0), "open", 4)], None),
+    );
 
     let before = Utc::now();
     let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
@@ -121,8 +132,9 @@ fn first_sync_paginates_skips_prs_and_stores() {
     assert_eq!((report.new_issues, report.updated), (2, 2));
     assert_eq!(
         (report.skipped_prs, report.pages, report.requests),
-        (1, 2, 2)
+        (1, 3, 3)
     );
+    assert_eq!(report.unchanged, 0, "re-listed items are deduplicated");
 
     let store = h.store.lock().unwrap();
     let row = store.issue(&issue_ref(3)).unwrap().unwrap().data;
@@ -295,16 +307,118 @@ fn budget_exhaustion_is_partial_and_the_next_run_resumes() {
 #[test]
 fn unsafe_listing_link_is_refused() {
     let h = harness(10);
+    let evil = "https://evil.example.com/repos/o/r/issues?page=2";
+    h.fixture
+        .expect_get(FIRST, page(vec![issue(1, at(1, 0), "open", 0)], Some(evil)));
+    // No progress past 01:00, so the `Link` page would be followed: refused.
     h.fixture.expect_get(
-        FIRST,
-        page(
-            vec![issue(1, at(1, 0), "open", 0)],
-            Some("https://evil.example.com/repos/o/r/issues?page=2"),
-        ),
+        format!("{FIRST}&since=2026-11-20T01:00:00Z"),
+        page(vec![issue(1, at(1, 0), "open", 0)], Some(evil)),
     );
     let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
     assert!(report.partial);
-    assert_eq!(h.fixture.request_count(), 1);
+    assert_eq!(h.fixture.request_count(), 2);
+}
+
+/// Seeds an incremental state: watermark 10:00, full pass done at 00:00.
+fn seed_incremental(h: &Harness) {
+    h.store
+        .lock()
+        .unwrap()
+        .save_sync_state(
+            &repo(),
+            &SyncState {
+                since: Some(at(10, 0)),
+                last_full_at: Some(at(0, 0)),
+                last_sync_at: Some(at(10, 0)),
+                ..SyncState::default()
+            },
+        )
+        .unwrap();
+}
+
+const ALL_SINCE: &str =
+    "/repos/o/r/issues?state=all&sort=updated&direction=asc&per_page=100&since=";
+
+#[test]
+fn mid_pass_update_cannot_skip_an_item() {
+    // Issues 1..4 updated at 10:01..10:04, two per page for brevity. While
+    // the pass reads page 1 (issues 1, 2), issue 1 is updated at 10:30 and
+    // moves to the end: by page number, page 2 would now be [4, 1] and
+    // issue 3 would be skipped for good. Keyset paging asks for "updated at
+    // or after 10:02" instead and sees every item.
+    let h = harness(10);
+    seed_incremental(&h);
+    let page2 = "https://api.github.com/repositories/1/issues?state=all&page=2";
+    h.fixture.expect_get(
+        format!("{ALL_SINCE}2026-11-20T09:50:00Z"),
+        page(
+            vec![
+                issue(1, at(10, 1), "open", 0),
+                issue(2, at(10, 2), "open", 0),
+            ],
+            Some(page2),
+        ),
+    );
+    h.fixture.expect_get(
+        format!("{ALL_SINCE}2026-11-20T10:02:00Z"),
+        page(
+            vec![
+                issue(2, at(10, 2), "open", 0),
+                issue(3, at(10, 3), "open", 0),
+                issue(4, at(10, 4), "open", 0),
+                issue(1, at(10, 30), "closed", 1),
+            ],
+            None,
+        ),
+    );
+    let before = Utc::now();
+    let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert!(!report.partial);
+    assert_eq!(
+        (report.new_issues, report.updated, report.unchanged),
+        (4, 5, 0)
+    );
+    let store = h.store.lock().unwrap();
+    let one = store.issue(&issue_ref(1)).unwrap().unwrap().data;
+    assert_eq!(one.state.as_str(), "closed");
+    for n in 1..=4 {
+        assert!(store.issue(&issue_ref(n)).unwrap().is_some(), "issue {n}");
+    }
+    let state = store.sync_state(&repo()).unwrap();
+    assert!(state.since.unwrap() >= before - TimeDelta::seconds(1));
+}
+
+#[test]
+fn a_full_page_at_one_timestamp_follows_link_and_keeps_the_watermark() {
+    let h = harness(10);
+    seed_incremental(&h);
+    let page2 =
+        "https://api.github.com/repositories/1/issues?state=all&since=2026-11-20T09:50:00Z&page=2";
+    // Every item is at the `since` time itself: no progress by keyset.
+    h.fixture.expect_get(
+        format!("{ALL_SINCE}2026-11-20T09:50:00Z"),
+        page(
+            vec![
+                issue(5, at(9, 50), "open", 0),
+                issue(6, at(9, 50), "open", 0),
+            ],
+            Some(page2),
+        ),
+    );
+    h.fixture
+        .expect_get(page2, page(vec![issue(7, at(10, 30), "open", 0)], None));
+    let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert!(!report.partial);
+    assert_eq!(report.new_issues, 3);
+    // Page numbers can skip items, so the watermark does not move past the
+    // one this pass started from.
+    let state = h.store.lock().unwrap().sync_state(&repo()).unwrap();
+    assert!(!state.partial);
+    assert_eq!(state.since, Some(at(10, 0)));
+    assert_eq!(report.watermark, Some(at(10, 0)));
 }
 
 // ---------------------------------------------------------------------------
