@@ -283,7 +283,16 @@ impl GitHubPolicyFiles {
                     etag: state.etag.clone(),
                     fetched_at: state.checked_at,
                 }];
-                rows.extend(state.rows.iter().flatten().cloned());
+                // Restamp every row with the check time: the snapshot is
+                // all-or-nothing, so `cache prune` (by `fetched_at`) must never
+                // keep the marker while dropping its file / absent rows.
+                rows.extend(state.rows.iter().flatten().cloned().map(|mut row| {
+                    row.fetched_at = state.checked_at;
+                    if let Some(file) = row.file.as_mut() {
+                        file.fetched_at = state.checked_at;
+                    }
+                    row
+                }));
                 store.replace_policy_files(&state.repo, &rows)?;
             }
         }
@@ -353,6 +362,10 @@ impl GitHubPolicyFiles {
         };
         let ttl = self.config.ttls().policy_files;
         let now = Utc::now();
+        // An existing source always caches one row per candidate (found or
+        // absent). A marker for an existing source with no such rows is an
+        // incomplete snapshot (e.g. pruned by an older version): a miss.
+        let marker = marker.filter(|m| m.data.status != 200 || !cached_rows.is_empty());
 
         if let Read::Cached(mode) = read {
             let young = marker.as_ref().is_some_and(|m| {

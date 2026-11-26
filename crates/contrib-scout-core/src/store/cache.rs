@@ -55,9 +55,17 @@ const PRUNE: &[(&str, &str)] = &[
         "discover_runs",
         "DELETE FROM discover_runs WHERE fetched_at < ?1",
     ),
+    // Per repository, all-or-nothing, keyed by the snapshot marker's
+    // `fetched_at` (path ''): a marker kept without its file / absent rows
+    // would be served as a complete, empty snapshot. Rows of a repository
+    // without a marker are pruned by their own `fetched_at`.
     (
         "policy_files",
-        "DELETE FROM policy_files WHERE fetched_at < ?1",
+        "DELETE FROM policy_files WHERE repo IN (
+             SELECT repo FROM policy_files WHERE path = '' AND fetched_at < ?1
+         ) OR (fetched_at < ?1 AND repo NOT IN (
+             SELECT repo FROM policy_files WHERE path = ''
+         ))",
     ),
     (
         "repo_activity",

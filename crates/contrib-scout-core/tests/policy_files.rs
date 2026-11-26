@@ -447,3 +447,118 @@ fn org_policy_repo_is_probed_once() {
     assert_eq!(fetch.sources.len(), 1);
     assert_eq!(fetch.files.len(), 1);
 }
+
+/// Rewrites every cached row of `source` with `fetched_at` moved back by
+/// `days` (only the rows for which `pick` is true).
+fn age_rows(store: &SharedStore, source: &RepoName, days: i64, pick: impl Fn(&str) -> bool) {
+    let mut store = store.lock().unwrap();
+    let rows: Vec<_> = store
+        .cached_policy_files(source)
+        .unwrap()
+        .into_iter()
+        .map(|cached| {
+            let mut row = cached.data;
+            if pick(&row.path) {
+                row.fetched_at -= chrono::Duration::days(days);
+                if let Some(file) = row.file.as_mut() {
+                    file.fetched_at -= chrono::Duration::days(days);
+                }
+            }
+            row
+        })
+        .collect();
+    store.replace_policy_files(source, &rows).unwrap();
+}
+
+#[test]
+fn prune_after_304_revalidation_keeps_the_snapshot_whole() {
+    let h = harness(Config::default());
+    script_cold(&h.fixture);
+    let cold = h.service.fetch(&repo(), Freshness::Default).unwrap();
+    assert_eq!(cold.len(), 4);
+    let org: RepoName = "acme/.github".parse().unwrap();
+    // The cold fetch happened a month ago.
+    age_rows(&h.store, &org, 30, |_| true);
+    age_rows(&h.store, &repo(), 30, |_| true);
+
+    // Revalidation: both HEADs unchanged.
+    h.fixture.expect_get(ORG_HEAD, ApiResponse::not_modified());
+    h.fixture.expect_get(REPO_HEAD, ApiResponse::not_modified());
+    h.service.fetch(&repo(), Freshness::Fresh).unwrap();
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+    h.store.lock().unwrap().prune(cutoff).unwrap();
+
+    // A live read after the prune still returns every file.
+    h.fixture.expect_get(ORG_HEAD, ApiResponse::not_modified());
+    h.fixture.expect_get(REPO_HEAD, ApiResponse::not_modified());
+    let live = Freshness::Live.live().unwrap();
+    let files = h.service.fetch_live(&repo(), live, true).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(files.get().len(), 4);
+    assert_eq!(files.get()[0].text.as_deref(), Some(ORG_CONTRIB));
+}
+
+#[test]
+fn prune_drops_a_snapshot_with_an_old_marker_entirely() {
+    let h = harness(Config::default());
+    script_cold(&h.fixture);
+    h.service.fetch(&repo(), Freshness::Default).unwrap();
+    // Only the marker is old: the whole snapshot goes, not just the marker.
+    age_rows(&h.store, &repo(), 30, |path| path.is_empty());
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+    let mut store = h.store.lock().unwrap();
+    store.prune(cutoff).unwrap();
+    assert!(store.cached_policy_files(&repo()).unwrap().is_empty());
+    let org: RepoName = "acme/.github".parse().unwrap();
+    assert!(!store.cached_policy_files(&org).unwrap().is_empty());
+}
+
+#[test]
+fn marker_without_rows_is_a_cache_miss() {
+    let h = harness(Config::default());
+    script_cold(&h.fixture);
+    h.service.fetch(&repo(), Freshness::Default).unwrap();
+    // Keep only the repository's marker (as an older prune would have).
+    {
+        let mut store = h.store.lock().unwrap();
+        let marker: Vec<_> = store
+            .cached_policy_files(&repo())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.data)
+            .filter(|row| row.path.is_empty())
+            .collect();
+        assert_eq!(marker.len(), 1);
+        store.replace_policy_files(&repo(), &marker).unwrap();
+    }
+
+    // Same HEAD (304), but the snapshot is incomplete: the repository is re-listed.
+    h.fixture.expect_get(ORG_HEAD, ApiResponse::not_modified());
+    h.fixture.expect_get(REPO_HEAD, ApiResponse::not_modified());
+    let repo_listing = listing(
+        [
+            Some(vec![blob_entry("README.md", "r-readme", REPO_README.len())]),
+            None,
+            None,
+        ],
+        &[("README.md", blob("r-readme", REPO_README))],
+    );
+    h.fixture
+        .expect_graphql(graphql(json!({ "s0": repo_listing })));
+    let live = Freshness::Live.live().unwrap();
+    let files = h.service.fetch_live(&repo(), live, true).unwrap();
+    h.fixture.assert_drained();
+    let paths: Vec<(String, String)> = files
+        .get()
+        .iter()
+        .map(|f| (f.repo.to_string(), f.path.clone()))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            ("acme/.github".into(), "CONTRIBUTING.md".into()),
+            ("acme/widget".into(), "README.md".into()),
+        ]
+    );
+}
