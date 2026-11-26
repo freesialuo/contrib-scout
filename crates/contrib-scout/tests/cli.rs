@@ -95,8 +95,6 @@ fn every_command_has_help() {
 fn stubs_return_a_json_error_envelope() {
     let fixture = Fixture::new("stub");
     let stubs: &[&[&str]] = &[
-        &["--json", "discover"],
-        &["--json", "repo", "show", "a/b"],
         &["--json", "policy", "files", "a/b"],
         &[
             "--json",
@@ -110,7 +108,6 @@ fn stubs_return_a_json_error_envelope() {
             "--note",
             "n",
         ],
-        &["--json", "candidates"],
         &["--json", "issue", "show", "a/b#1"],
         &["--json", "gate", "start", "https://github.com/a/b/issues/1"],
         &["--json", "gate", "pr", "a/b#1", "--branch", "x"],
@@ -198,4 +195,126 @@ fn config_get_and_set() {
     assert_eq!(envelope["error"]["code"], "usage");
     let output = fixture.run(&["config", "get", "nope"]);
     assert_eq!(output.status.code(), Some(2));
+}
+
+// --- step 4: discover, repo show, candidates ---
+
+fn envelope_of(output: &Output) -> Value {
+    serde_json::from_str(stdout(output).trim()).unwrap()
+}
+
+#[test]
+fn candidates_on_an_empty_index_makes_zero_requests() {
+    let fixture = Fixture::new("candidates");
+    let output = fixture.run(&["--json", "candidates", "--min-score", "10"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let envelope = envelope_of(&output);
+    assert_eq!(envelope["data"]["candidates"], serde_json::json!([]));
+    assert_eq!(envelope["data"]["excluded_marked"], 0);
+    assert_eq!(envelope["meta"]["requests"], 0);
+    let human = fixture.run(&["candidates"]);
+    assert!(stdout(&human).contains("No candidates"), "{human:?}");
+}
+
+#[test]
+fn discover_explain_makes_no_requests() {
+    let fixture = Fixture::new("explain");
+    let output = fixture.run(&[
+        "--json",
+        "discover",
+        "--explain",
+        "--lang",
+        "rust",
+        "--limit",
+        "5",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let envelope = envelope_of(&output);
+    assert_eq!(envelope["meta"]["requests"], 0);
+    assert_eq!(envelope["data"]["estimated_requests"], 1 + 3 * 5);
+    assert!(envelope["data"]["query"]
+        .as_str()
+        .unwrap()
+        .contains("language:rust"));
+    let human = fixture.run(&["discover", "--explain"]);
+    assert!(stdout(&human).contains("Estimated requests"), "{human:?}");
+}
+
+#[test]
+fn offline_discover_without_cache_fails_without_requests() {
+    let fixture = Fixture::new("discover-offline");
+    let output = fixture.run(&["--json", "--offline", "discover"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(envelope_of(&output)["error"]["code"], "not_found");
+}
+
+#[test]
+fn repo_show_includes_the_policy_reminder() {
+    use contrib_scout_core::models::{Evidence, PolicyMark, PolicyScope, RepoProfile, Stance};
+    use contrib_scout_core::store::Store;
+    let fixture = Fixture::new("repo-show");
+    let output = fixture.run(&["--json", "--offline", "repo", "show", "a/b"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(envelope_of(&output)["error"]["code"], "not_found");
+
+    let now = chrono::Utc::now();
+    let db = fixture.root.join("scout.db");
+    let profile = RepoProfile {
+        repo: "a/b".parse().unwrap(),
+        description: Some("demo".into()),
+        archived: false,
+        fork: false,
+        license: Some("MIT".into()),
+        default_branch: Some("main".into()),
+        language: Some("Rust".into()),
+        topics: vec!["cli".into()],
+        stars: 7,
+        pushed_at: Some(now),
+        fetched_at: now,
+        activity: None,
+    };
+    Store::open(&db)
+        .unwrap()
+        .save_repo(&profile, &serde_json::json!({}), Some("\"e\""))
+        .unwrap();
+    let output = fixture.run(&["--json", "--offline", "repo", "show", "a/b"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let json = envelope_of(&output);
+    assert_eq!(json["data"]["profile"]["stars"], 7);
+    assert_eq!(json["meta"]["requests"], 0);
+    assert_eq!(json["meta"]["reminders"][0]["kind"], "unmarked");
+    let human = fixture.run(&["--offline", "repo", "show", "a/b"]);
+    assert!(
+        stdout(&human).contains("a/b: AI policy not marked"),
+        "{human:?}"
+    );
+
+    Store::open(&db)
+        .unwrap()
+        .put_mark(&PolicyMark {
+            target: "a".parse().unwrap(),
+            stance: Stance::Bans,
+            scope: PolicyScope::default(),
+            requirements: Vec::new(),
+            evidence: vec![Evidence {
+                path: "CONTRIBUTING.md".into(),
+                lines: None,
+                url: "https://github.com/a/.github/blob/x/CONTRIBUTING.md".into(),
+                excerpt: "No AI.".into(),
+            }],
+            note: "org bans AI".into(),
+            marked_by: "agent-a".parse().unwrap(),
+            marked_at: now,
+            expires_at: now + chrono::TimeDelta::days(90),
+        })
+        .unwrap();
+    let json = envelope_of(&fixture.run(&["--json", "--offline", "repo", "show", "a/b"]));
+    assert_eq!(json["meta"]["reminders"][0]["kind"], "marked");
+    assert_eq!(json["meta"]["reminders"][0]["note"], "org bans AI");
+    let text = stdout(&fixture.run(&["--offline", "repo", "show", "a/b"]));
+    assert!(text.contains("org bans AI"), "{text}");
+    assert!(
+        text.contains("activity not computed (repository marked Bans)"),
+        "{text}"
+    );
 }
