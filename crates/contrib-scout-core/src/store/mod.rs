@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 pub use cache::{CacheStats, CachedResponse, DiscoverRun, PruneStats};
 pub use issues::{IssueFilter, SyncState};
-pub use policy::CachedPolicyFile;
+pub use policy::{CachedPolicyFile, POLICY_SNAPSHOT_PATH};
 
 /// Services share one connection per process.
 pub type SharedStore = Arc<Mutex<Store>>;

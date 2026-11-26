@@ -1,10 +1,10 @@
 //! `policy_marks`, `policy_mark_history`, `policy_files` (§5, §6).
 //!
-//! Mark storage (everything above `cached_policy_file`) is implemented; the
-//! policy-file cache is owned by step 3.
+//! Mark storage, plus the policy-file cache (raw candidate files, snapshot
+//! markers, and cached absence).
 
 use super::{from_unix, Cached, Store};
-use crate::error::{not_implemented, Result};
+use crate::error::Result;
 use crate::models::{
     AgentId, MarkAction, MarkTarget, PolicyFile, PolicyMark, PolicyMarkEvent, RepoName, Stance,
 };
@@ -12,16 +12,128 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 
-/// A cached candidate-path probe. `file` is `None` when GitHub answered 404,
-/// so absence is cached too and revalidated with its ETag.
+/// One `policy_files` row. Three kinds share the table, all keyed by
+/// `(repo, path)`:
+/// - the per-repository snapshot marker ([`POLICY_SNAPSHOT_PATH`]): `status`
+///   is the `commits/HEAD` answer (200, or 404 / 409 when the repository is
+///   missing or empty), `commit` the HEAD commit, `etag` its validator;
+/// - a found candidate file: `status` 200 and `file` set;
+/// - an absent candidate path: `status` 404, `file` `None`, `url` the
+///   commit-pinned location that was checked. Absence is cached too.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CachedPolicyFile {
     pub repo: RepoName,
     pub path: String,
     pub status: u16,
     pub file: Option<PolicyFile>,
+    /// Commit the probe was made at (marker and absent rows).
+    pub commit: Option<String>,
+    /// Pinned URL: the file's for found rows, the checked location for absent rows.
+    pub url: Option<String>,
     pub etag: Option<String>,
     pub fetched_at: DateTime<Utc>,
+}
+
+/// `path` of the per-repository snapshot marker row in `policy_files`.
+pub const POLICY_SNAPSHOT_PATH: &str = "";
+
+const POLICY_FILE_COLUMNS: &str =
+    "repo, path, status, url, sha, text, size, truncated, etag, fetched_at";
+
+struct PolicyFileRow {
+    repo: String,
+    path: String,
+    status: u16,
+    url: Option<String>,
+    sha: Option<String>,
+    text: Option<String>,
+    size: i64,
+    truncated: bool,
+    etag: Option<String>,
+    fetched_at: i64,
+}
+
+fn policy_file_from_row(row: &Row<'_>) -> rusqlite::Result<PolicyFileRow> {
+    Ok(PolicyFileRow {
+        repo: row.get(0)?,
+        path: row.get(1)?,
+        status: row.get(2)?,
+        url: row.get(3)?,
+        sha: row.get(4)?,
+        text: row.get(5)?,
+        size: row.get(6)?,
+        truncated: row.get(7)?,
+        etag: row.get(8)?,
+        fetched_at: row.get(9)?,
+    })
+}
+
+impl PolicyFileRow {
+    fn into_cached(self) -> Result<Cached<CachedPolicyFile>> {
+        let repo: RepoName = self
+            .repo
+            .parse()
+            .with_context(|| format!("stored policy file repo {:?}", self.repo))?;
+        let fetched_at = from_unix(self.fetched_at)?;
+        let is_file = self.status == 200 && self.path != POLICY_SNAPSHOT_PATH;
+        let file = is_file.then(|| PolicyFile {
+            repo: repo.clone(),
+            path: self.path.clone(),
+            url: self.url.clone().unwrap_or_default(),
+            text: self.text.clone(),
+            truncated: self.truncated,
+            size: u64::try_from(self.size).unwrap_or_default(),
+            sha: self.sha.clone(),
+            fetched_at,
+        });
+        Ok(Cached {
+            data: CachedPolicyFile {
+                repo,
+                path: self.path,
+                status: self.status,
+                file,
+                commit: if is_file { None } else { self.sha },
+                url: self.url,
+                etag: self.etag,
+                fetched_at,
+            },
+            fetched_at,
+        })
+    }
+}
+
+fn insert_policy_file(conn: &rusqlite::Connection, file: &CachedPolicyFile) -> Result<()> {
+    let (url, sha, text, size, truncated) = match &file.file {
+        Some(found) => (
+            Some(found.url.clone()),
+            found.sha.clone(),
+            found.text.clone(),
+            i64::try_from(found.size).unwrap_or(i64::MAX),
+            found.truncated,
+        ),
+        None => (file.url.clone(), file.commit.clone(), None, 0, false),
+    };
+    conn.execute(
+        "INSERT INTO policy_files (repo, path, status, url, sha, text, size, truncated, etag, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(repo, path) DO UPDATE SET status = excluded.status, url = excluded.url,
+             sha = excluded.sha, text = excluded.text, size = excluded.size,
+             truncated = excluded.truncated, etag = excluded.etag,
+             fetched_at = excluded.fetched_at",
+        params![
+            file.repo.to_string(),
+            file.path,
+            file.status,
+            url,
+            sha,
+            text,
+            size,
+            truncated,
+            file.etag,
+            file.fetched_at.timestamp(),
+        ],
+    )?;
+    Ok(())
 }
 
 const MARK_COLUMNS: &str = "target, target_kind, stance, scope_json, requirements_json, \
@@ -260,15 +372,86 @@ impl Store {
         Ok(marks)
     }
 
+    /// One `policy_files` row. `path` matches exactly first, then
+    /// case-insensitively (GitHub paths are case-sensitive, agents' typing is not).
     pub fn cached_policy_file(
         &self,
-        _repo: &RepoName,
-        _path: &str,
+        repo: &RepoName,
+        path: &str,
     ) -> Result<Option<Cached<CachedPolicyFile>>> {
-        Err(not_implemented("policy file cache"))
+        let exact =
+            format!("SELECT {POLICY_FILE_COLUMNS} FROM policy_files WHERE repo = ?1 AND path = ?2");
+        let row = match self
+            .conn
+            .query_row(
+                &exact,
+                params![repo.to_string(), path],
+                policy_file_from_row,
+            )
+            .optional()?
+        {
+            Some(row) => Some(row),
+            None => {
+                let loose = format!(
+                    "SELECT {POLICY_FILE_COLUMNS} FROM policy_files
+                     WHERE repo = ?1 AND path = ?2 COLLATE NOCASE ORDER BY status, path LIMIT 1"
+                );
+                self.conn
+                    .query_row(
+                        &loose,
+                        params![repo.to_string(), path],
+                        policy_file_from_row,
+                    )
+                    .optional()?
+            }
+        };
+        row.map(PolicyFileRow::into_cached).transpose()
     }
 
-    pub fn save_policy_file(&mut self, _file: &CachedPolicyFile) -> Result<()> {
-        Err(not_implemented("policy file cache"))
+    /// The cached row whose pinned URL is `url`, if any (evidence given as a URL).
+    pub fn cached_policy_file_by_url(&self, url: &str) -> Result<Option<Cached<CachedPolicyFile>>> {
+        let sql = format!(
+            "SELECT {POLICY_FILE_COLUMNS} FROM policy_files WHERE url = ?1 ORDER BY fetched_at DESC LIMIT 1"
+        );
+        self.conn
+            .query_row(&sql, params![url], policy_file_from_row)
+            .optional()?
+            .map(PolicyFileRow::into_cached)
+            .transpose()
+    }
+
+    /// Every row cached for `repo` (marker included), ordered by path.
+    pub fn cached_policy_files(&self, repo: &RepoName) -> Result<Vec<Cached<CachedPolicyFile>>> {
+        let sql =
+            format!("SELECT {POLICY_FILE_COLUMNS} FROM policy_files WHERE repo = ?1 ORDER BY path");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![repo.to_string()], policy_file_from_row)?;
+        rows.map(|row| row?.into_cached()).collect()
+    }
+
+    /// Upserts one row.
+    pub fn save_policy_file(&mut self, file: &CachedPolicyFile) -> Result<()> {
+        insert_policy_file(&self.conn, file)
+    }
+
+    /// Replaces every row of `repo` with `files` in one transaction (a new
+    /// snapshot: renamed or deleted files must not linger).
+    pub fn replace_policy_files(
+        &mut self,
+        repo: &RepoName,
+        files: &[CachedPolicyFile],
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM policy_files WHERE repo = ?1",
+            params![repo.to_string()],
+        )?;
+        for file in files {
+            insert_policy_file(&tx, file)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
