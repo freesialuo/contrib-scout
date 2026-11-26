@@ -1002,6 +1002,10 @@ pub struct IssueDetail {
     pub comments: Vec<IssueComment>,
     #[serde(default)]
     pub linked_prs: Vec<LinkedPr>,
+    /// The number is a pull request (GitHub's issues API answers for PRs too).
+    /// `issue show` still shows it; gates refuse it.
+    #[serde(default)]
+    pub is_pull_request: bool,
 }
 
 // ---------------------------------------------------------------------------

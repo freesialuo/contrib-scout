@@ -715,6 +715,7 @@ impl GitHubIndexer {
                 body: body["body"].as_str().map(str::to_owned),
                 comments,
                 linked_prs: linked.into_values().collect(),
+                is_pull_request: body.get("pull_request").is_some(),
                 row,
             },
             as_of: as_of.unwrap_or_else(Utc::now),

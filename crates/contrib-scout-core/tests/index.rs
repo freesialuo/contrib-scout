@@ -678,3 +678,23 @@ fn real_shape_sidebar_events_link_and_unlink_prs() {
     );
     assert_eq!(prs.len(), 1);
 }
+
+#[test]
+fn issue_detail_says_when_the_number_is_a_pull_request() {
+    let h = harness(10);
+    let mut body = issue(9, at(1, 0), "open", 0);
+    body["pull_request"] = json!({"html_url": "https://github.com/o/r/pull/9"});
+    h.fixture.expect_get(ISSUE, ApiResponse::json(200, &body));
+    h.fixture
+        .expect_get(TIMELINE, ApiResponse::json(200, &json!([])));
+    let detail = h.indexer.issue(&issue_ref(9), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    assert!(detail.is_pull_request);
+    assert!(h
+        .store
+        .lock()
+        .unwrap()
+        .issue(&issue_ref(9))
+        .unwrap()
+        .is_none());
+}

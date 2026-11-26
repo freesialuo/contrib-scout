@@ -776,6 +776,12 @@ impl LiveGatekeeper {
         let viewer = self.viewer(live)?;
         let repo = self.profiler.profile_live(&issue.repo, live)?;
         let detail = self.indexer.issue_live(issue, live)?;
+        if detail.get().is_pull_request {
+            return Err(ScoutError::Usage(format!(
+                "{issue} is a pull request, not an issue; gates take the issue the PR is for"
+            ))
+            .into());
+        }
         let closing = self.closing_prs(issue)?;
         let detail = merge_linked_prs(detail, closing);
         let policy_files = self
@@ -860,6 +866,10 @@ impl LiveGatekeeper {
             Ok(report) => {
                 self.store().log_gate(&report)?;
                 Ok(report)
+            }
+            // A wrong ref (e.g. a pull request) is not a gate run: exit 2, no log.
+            Err(error) if matches!(ScoutError::find(&error), Some(ScoutError::Usage(_))) => {
+                Err(error)
             }
             Err(error) => {
                 let failed = GateReport {

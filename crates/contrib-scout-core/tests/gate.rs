@@ -810,6 +810,36 @@ fn closing_reference_graphql_errors_fail_closed() {
 }
 
 #[test]
+fn a_pull_request_ref_is_a_usage_error() {
+    let h = harness();
+    put_mark(&h, |_| {});
+    h.fixture
+        .expect_get("/user", ApiResponse::json(200, &json!({"login": "me"})));
+    h.fixture.expect_get(
+        "/repos/o/r",
+        ApiResponse::json(
+            200,
+            &json!({"full_name": "o/r", "archived": false, "fork": false}),
+        ),
+    );
+    let mut body = issue_json(&Spec::default());
+    body["pull_request"] = json!({"html_url": "https://github.com/o/r/pull/7"});
+    h.fixture.expect_get(ISSUE, ApiResponse::json(200, &body));
+    h.fixture
+        .expect_get(TIMELINE, ApiResponse::json(200, &json!([])));
+    let error = h.gate.start(&issue_ref(), &agent("a1")).unwrap_err();
+    h.fixture.assert_drained();
+    let Some(ScoutError::Usage(message)) = ScoutError::find(&error) else {
+        panic!("expected a usage error, got {error:#}");
+    };
+    assert!(message.contains("is a pull request"), "{message}");
+    assert_eq!(ScoutError::find(&error).unwrap().exit_code(), 2);
+    // Not a gate run: no claim, nothing logged.
+    assert!(h.gate.claims().list(None).unwrap().is_empty());
+    assert!(store(&h).gate_reports(None).unwrap().is_empty());
+}
+
+#[test]
 fn network_down_fails_closed_even_with_a_warm_cache() {
     let h = harness();
     put_mark(&h, |_| {});

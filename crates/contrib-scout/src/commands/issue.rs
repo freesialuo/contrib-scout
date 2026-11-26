@@ -162,6 +162,12 @@ fn show_lines(detail: &IssueDetail, status: Option<&IssueMarkStatus>) -> Vec<Str
         format!("{} [{}] {}", row.issue, row.state, row.title),
         row.issue.html_url(),
     ];
+    if detail.is_pull_request {
+        lines.push(format!(
+            "Note: {} is a pull request, not an issue; gates refuse it.",
+            row.issue
+        ));
+    }
     if let Some(author) = &detail.author {
         lines.push(format!("Author: {author}"));
     }
