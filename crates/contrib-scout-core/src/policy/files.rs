@@ -703,7 +703,7 @@ fn blob_text(blob: &Value, max: usize) -> (String, bool, u64) {
 }
 
 /// `data` of a GraphQL response; any `errors` fail the call.
-fn graphql_data(response: &ApiResponse) -> Result<Value> {
+pub(crate) fn graphql_data(response: &ApiResponse) -> Result<Value> {
     let body: Value = response.json_body().context("parse GraphQL response")?;
     if let Some(errors) = body
         .get("errors")

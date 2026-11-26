@@ -230,7 +230,7 @@ struct IssueMark {
 | issue 仍是 open | ✓ | ✓ |
 | issue 未被标为 Skip（否则 `blocked: issue_skipped`） | ✓ | ✓ |
 | 未被指派，或指派给我 | ✓ | ✓ |
-| timeline 中没有别人的关联 PR（cross-referenced / connected 事件） | ✓ | ✓（排除我自己的分支） |
+| timeline 中没有别人的关联 PR（cross-referenced / connected 事件），以及 GraphQL `closedByPullRequestsReferences`（Development 侧栏关联的 PR 可能不出现在 timeline 里） | ✓ | ✓（排除我自己的分支） |
 | 最近评论里没有人认领（启发式判断，只报告不裁决） | ✓ | ✓ |
 | 仓库未归档 | ✓ | ✓ |
 | 仓库或组织已有政策标记（没有标记则 `blocked: policy_unmarked`） | ✓ | ✓ |

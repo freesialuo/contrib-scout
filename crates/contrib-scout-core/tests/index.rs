@@ -635,3 +635,46 @@ fn issue_live_revalidates_and_never_falls_back_to_cache() {
     // The cached read still works offline.
     assert!(h.indexer.issue(&issue_ref(9), Freshness::Offline).is_ok());
 }
+
+/// A `connected` / `disconnected` event as GitHub really sends it (recorded
+/// from cli/cli#15019, trimmed): a bare `subject`, no `pull_request` key.
+fn sidebar_event(event: &str, number: u64, state: &str, merged: bool) -> Value {
+    json!({
+        "event": event,
+        "actor": {"login": "Copilot", "type": "Bot"},
+        "created_at": "2026-11-16T14:11:14Z",
+        "subject": {
+            "draft": false,
+            "merged_at": if merged { json!("2026-11-18T17:25:29Z") } else { Value::Null },
+            "number": number,
+            "repository": {"full_name": "cli/cli", "html_url": "https://github.com/cli/cli"},
+            "state": state,
+            "title": "Fix workflow log truncation after long lines",
+            "type": "pull_request",
+            "url": format!("https://api.github.com/repos/cli/cli/pulls/{number}"),
+        },
+    })
+}
+
+#[test]
+fn real_shape_sidebar_events_link_and_unlink_prs() {
+    use contrib_scout_core::index::apply_pr_event;
+    let mut prs = std::collections::BTreeMap::new();
+    apply_pr_event(&sidebar_event("connected", 15065, "merged", true), &mut prs);
+    apply_pr_event(&sidebar_event("connected", 15070, "open", false), &mut prs);
+    let merged = &prs["https://github.com/cli/cli/pull/15065"];
+    assert_eq!(merged.event, "connected");
+    assert_eq!(merged.state.as_deref(), Some("merged"));
+    assert_eq!(merged.author, None);
+    assert_eq!(
+        prs["https://github.com/cli/cli/pull/15070"]
+            .state
+            .as_deref(),
+        Some("open")
+    );
+    apply_pr_event(
+        &sidebar_event("disconnected", 15070, "open", false),
+        &mut prs,
+    );
+    assert_eq!(prs.len(), 1);
+}

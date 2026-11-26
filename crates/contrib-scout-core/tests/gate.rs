@@ -112,6 +112,8 @@ struct Spec {
     assignees: Vec<&'static str>,
     comments: Vec<Value>,
     timeline: Vec<Value>,
+    /// `closedByPullRequestsReferences.nodes` of the issue.
+    closing: Vec<Value>,
     files: bool,
     pulls: Vec<(u64, Value)>,
 }
@@ -126,6 +128,7 @@ impl Default for Spec {
             assignees: Vec::new(),
             comments: Vec::new(),
             timeline: Vec::new(),
+            closing: Vec::new(),
             files: false,
             pulls: Vec::new(),
         }
@@ -155,6 +158,48 @@ fn linked_pr(number: u64, author: &str, state: &str) -> Value {
                 "merged_at": Value::Null,
             },
         }},
+    })
+}
+
+/// A GraphQL answer listing `nodes` as the issue's closing references.
+fn closing_answer(nodes: &[Value]) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        &json!({"data": {"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": nodes}}}}}),
+    )
+}
+
+/// A closing-reference node, shaped like GitHub's real answer (recorded
+/// from cli/cli#15092, whose sidebar-linked PR #15127 has no timeline event).
+fn closing_pr(number: u64, author: &str, state: &str, head: &str) -> Value {
+    json!({
+        "number": number,
+        "url": format!("https://github.com/o/r/pull/{number}"),
+        "state": state,
+        "author": {"login": author},
+        "headRefName": head,
+        "merged": state == "MERGED",
+    })
+}
+
+/// A real-shape `connected` timeline event (recorded from cli/cli#15019):
+/// only a bare `subject`, no `pull_request` key, `html_url`, or `user`.
+fn connected_pr(number: u64, state: &str) -> Value {
+    json!({
+        "event": "connected",
+        "actor": {"login": "Copilot", "type": "Bot"},
+        "commit_id": null,
+        "created_at": "2026-11-16T14:11:14Z",
+        "subject": {
+            "draft": false,
+            "merged_at": if state == "merged" { json!("2026-11-18T17:25:29Z") } else { Value::Null },
+            "number": number,
+            "repository": {"full_name": "o/r", "html_url": "https://github.com/o/r"},
+            "state": state,
+            "title": "Fix the widget",
+            "type": "pull_request",
+            "url": format!("https://api.github.com/repos/o/r/pulls/{number}"),
+        },
     })
 }
 
@@ -237,6 +282,7 @@ fn script(fixture: &FixtureTransport, spec: &Spec) {
         TIMELINE,
         ApiResponse::json(200, &Value::Array(spec.timeline.clone())).with_etag("\"timeline\""),
     );
+    fixture.expect_graphql(closing_answer(&spec.closing));
     fixture.expect_get(ORG_HEAD, not_found());
     if spec.files {
         fixture.expect_get(REPO_HEAD, ApiResponse::new(200, SHA).with_etag("\"head\""));
@@ -307,9 +353,10 @@ fn start_passes_acquires_a_claim_and_logs() {
         raw.policy_mark.as_ref().unwrap().note,
         "AI allowed if disclosed"
     );
-    // user, repo, issue, timeline, two policy HEADs: a bounded number of live reads.
-    assert_eq!(h.fixture.request_count(), 6);
-    assert_eq!(h.gateway.metrics().requests, 6);
+    // user, repo, issue, timeline, closing references (GraphQL), two policy
+    // HEADs: a bounded number of live reads.
+    assert_eq!(h.fixture.request_count(), 7);
+    assert_eq!(h.gateway.metrics().requests, 7);
 
     let log = store(&h).gate_reports(Some(&issue_ref())).unwrap();
     assert_eq!(log.len(), 1);
@@ -647,6 +694,104 @@ fn code_forbidden_blocks_start_and_pr_with_human_required() {
 }
 
 #[test]
+fn sidebar_linked_pr_without_timeline_event_blocks() {
+    let h = harness();
+    put_mark(&h, |_| {});
+    let spec = Spec {
+        closing: vec![closing_pr(12, "someone", "OPEN", "fix-widget")],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a1");
+    assert_eq!(reasons(&report), [BlockReason::PrExists]);
+    assert!(
+        report.blocked_by[0].detail.contains("someone"),
+        "{:?}",
+        report.blocked_by
+    );
+
+    // Closed without merging: reported, not blocking.
+    let spec = Spec {
+        closing: vec![closing_pr(12, "someone", "CLOSED", "fix-widget")],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a1");
+    assert_eq!(report.verdict, GateVerdict::Pass);
+    assert!(kinds(&report).contains(&ObservationKind::ClosedPr));
+
+    // The query asks for open and closed closing references of this issue.
+    let requests = h.fixture.requests();
+    let query = requests
+        .iter()
+        .find_map(|r| match r {
+            Recorded::Graphql { query, variables }
+                if query.contains("closedByPullRequestsReferences") =>
+            {
+                Some((query.clone(), variables.clone()))
+            }
+            _ => None,
+        })
+        .expect("closing references query");
+    assert!(query.0.contains("includeClosedPrs: true"));
+    assert_eq!(query.1["number"], json!(7));
+}
+
+#[test]
+fn real_shape_connected_event_blocks() {
+    let h = harness();
+    put_mark(&h, |_| {});
+    let spec = Spec {
+        timeline: vec![connected_pr(12, "open")],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a1");
+    assert_eq!(reasons(&report), [BlockReason::PrExists]);
+
+    // GraphQL fills in what the event lacks (author, branch); one entry.
+    let spec = Spec {
+        timeline: vec![connected_pr(12, "open")],
+        closing: vec![closing_pr(12, "someone", "OPEN", "fix-widget")],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a1");
+    assert_eq!(reasons(&report), [BlockReason::PrExists]);
+    let linked = &report.raw.issue.as_ref().unwrap().linked_prs;
+    assert_eq!(linked.len(), 1, "{linked:?}");
+    let pr = &linked[0];
+    assert_eq!(pr.author.as_deref(), Some("someone"));
+    assert_eq!(pr.head_ref.as_deref(), Some("fix-widget"));
+}
+
+#[test]
+fn closing_reference_graphql_errors_fail_closed() {
+    let h = harness();
+    put_mark(&h, |_| {});
+    h.fixture
+        .expect_get("/user", ApiResponse::json(200, &json!({"login": "me"})));
+    h.fixture.expect_get(
+        "/repos/o/r",
+        ApiResponse::json(
+            200,
+            &json!({"full_name": "o/r", "archived": false, "fork": false}),
+        ),
+    );
+    h.fixture
+        .expect_get(ISSUE, ApiResponse::json(200, &issue_json(&Spec::default())));
+    h.fixture
+        .expect_get(TIMELINE, ApiResponse::json(200, &json!([])));
+    h.fixture.expect_graphql(ApiResponse::json(
+        200,
+        &json!({"data": {"repository": {"issue": null}}, "errors": [{"type": "NOT_FOUND", "message": "Could not resolve to an Issue with the number of 7."}]}),
+    ));
+    let error = h.gate.start(&issue_ref(), &agent("a1")).unwrap_err();
+    h.fixture.assert_drained();
+    assert!(
+        format!("{error:#}").contains("Could not resolve"),
+        "{error:#}"
+    );
+    assert!(h.gate.claims().list(None).unwrap().is_empty());
+}
+
+#[test]
 fn network_down_fails_closed_even_with_a_warm_cache() {
     let h = harness();
     put_mark(&h, |_| {});
@@ -690,6 +835,7 @@ fn not_modified_counts_as_live_confirmation() {
     for path in ["/repos/o/r", ISSUE, TIMELINE] {
         h.fixture.expect_get(path, ApiResponse::not_modified());
     }
+    h.fixture.expect_graphql(closing_answer(&[]));
     h.fixture.expect_get(ORG_HEAD, not_found());
     h.fixture.expect_get(REPO_HEAD, not_found());
     let before = h.gateway.metrics();
@@ -701,10 +847,10 @@ fn not_modified_counts_as_live_confirmation() {
         "Widget crashes"
     );
     let after = h.gateway.metrics();
-    assert_eq!(after.requests - before.requests, 6);
+    assert_eq!(after.requests - before.requests, 7);
     assert_eq!(after.served_304 - before.served_304, 3);
     // Revalidation, not a cache read: the conditional requests went out.
-    let revalidated = h.fixture.requests()[7..10]
+    let revalidated = h.fixture.requests()[8..11]
         .iter()
         .all(|r| matches!(r, Recorded::Get(req) if req.if_none_match.is_some()));
     assert!(revalidated);

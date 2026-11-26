@@ -274,43 +274,83 @@ pub fn safe_api_url(url: &str, suffix: &str) -> bool {
 
 /// Timeline `cross-referenced` / `connected` events add a PR, `disconnected`
 /// removes it (adapted from dwave `apply_pr_event`).
+///
+/// Two shapes occur. `cross-referenced` carries the PR as an issue object in
+/// `source.issue` (with a `pull_request` key, `html_url`, `user`). Real
+/// `connected` / `disconnected` events (Development sidebar links) carry a
+/// bare `subject` instead: `{type: "pull_request", number, url (API),
+/// state, merged_at, repository: {full_name, ...}}`, no `user`, no
+/// `html_url`. Sidebar links can also be absent from the timeline entirely,
+/// which is why gates add the GraphQL closing references
+/// (`closedByPullRequestsReferences`) on top.
 pub fn apply_pr_event(event: &Value, prs: &mut BTreeMap<String, LinkedPr>) {
-    let source = &event["source"]["issue"];
-    let target = &event["subject"];
-    let found = [source, target].into_iter().find_map(|issue| {
-        let pr = issue.get("pull_request")?.as_object()?;
-        let url = pr
-            .get("html_url")
-            .and_then(Value::as_str)
-            .or_else(|| issue["html_url"].as_str())?;
-        Some((issue, pr, url))
-    });
-    let Some((issue, pr, url)) = found else {
+    let Some(found) = event_pr(event) else {
         return;
     };
     match event["event"].as_str() {
         Some(name @ ("cross-referenced" | "connected")) => {
-            let merged = pr.get("merged_at").is_some_and(|m| !m.is_null());
             prs.insert(
-                url.to_owned(),
+                found.url.clone(),
                 LinkedPr {
-                    url: url.to_owned(),
+                    url: found.url,
                     event: name.to_owned(),
-                    author: issue["user"]["login"].as_str().map(str::to_owned),
-                    state: if merged {
-                        Some("merged".into())
-                    } else {
-                        issue["state"].as_str().map(str::to_owned)
-                    },
+                    author: found.author,
+                    state: found.state,
                     head_ref: None,
                 },
             );
         }
         Some("disconnected") => {
-            prs.remove(url);
+            prs.remove(&found.url);
         }
         _ => {}
     }
+}
+
+struct EventPr {
+    url: String,
+    author: Option<String>,
+    state: Option<String>,
+}
+
+fn event_pr(event: &Value) -> Option<EventPr> {
+    let source = &event["source"]["issue"];
+    let target = &event["subject"];
+    let as_issue = [source, target].into_iter().find_map(|issue| {
+        let pr = issue.get("pull_request")?.as_object()?;
+        let url = pr
+            .get("html_url")
+            .and_then(Value::as_str)
+            .or_else(|| issue["html_url"].as_str())?;
+        let merged = pr.get("merged_at").is_some_and(|m| !m.is_null());
+        Some(EventPr {
+            url: url.to_owned(),
+            author: issue["user"]["login"].as_str().map(str::to_owned),
+            state: if merged {
+                Some("merged".into())
+            } else {
+                issue["state"].as_str().map(str::to_owned)
+            },
+        })
+    });
+    as_issue.or_else(|| {
+        // The bare `subject` of `connected` / `disconnected`.
+        if target["type"].as_str() != Some("pull_request") {
+            return None;
+        }
+        let number = target["number"].as_u64()?;
+        let repo = target["repository"]["full_name"].as_str()?;
+        let merged = target.get("merged_at").is_some_and(|m| !m.is_null());
+        Some(EventPr {
+            url: format!("https://github.com/{repo}/pull/{number}"),
+            author: None,
+            state: if merged {
+                Some("merged".into())
+            } else {
+                target["state"].as_str().map(str::to_ascii_lowercase)
+            },
+        })
+    })
 }
 
 /// Errors after which a sync keeps what it stored and reports `partial`.

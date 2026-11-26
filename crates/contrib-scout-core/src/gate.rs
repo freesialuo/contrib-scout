@@ -10,14 +10,17 @@
 //!    "my own PR" detection. Never stored.
 //! 2. `GET /repos/{o}/{r}` (archived).
 //! 3. The issue, its last `gate_comments` comments (at most 2 pages), and its
-//!    timeline pages (linked PRs).
+//!    timeline pages (linked PRs), plus one GraphQL query for the issue's
+//!    closing references (`closedByPullRequestsReferences`, open and closed):
+//!    PRs linked in the Development sidebar can be missing from the timeline
+//!    or appear only as a bare `connected` subject without author.
 //! 4. Policy files: one `commits/HEAD` check per source (`{owner}/.github` and
 //!    the repository), plus GraphQL only when a HEAD moved.
 //! 5. `gate pr --branch` only: `GET /repos/{o}/{r}/pulls/{n}` for linked open or
 //!    merged PRs authored by the login, at most [`MAX_PR_LOOKUPS`], to read
 //!    their head branch.
 //!
-//! Every read except (1) is conditional; a 304 is a live confirmation. Network
+//! Every read except (1) and the GraphQL queries is conditional; a 304 is a live confirmation. Network
 //! or quota failure ⇒ `Err` (the CLI exits 1); the attempt is still written to
 //! `gate_log` with verdict `error`. Nothing falls back to the cache.
 
@@ -35,13 +38,14 @@ use crate::models::{
     ObservationSeverity, PolicyFile, PolicyMark, RepoName, RepoProfile, Requirement, Restriction,
     Stance,
 };
+use crate::policy::files::graphql_data;
 use crate::policy::{GitHubPolicyFiles, PolicyFiles};
 use crate::profile::{GitHubProfiler, RepoProfiler};
 use crate::store::{SharedStore, Store};
 use crate::transport::ApiRequest;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::{Arc, MutexGuard, PoisonError};
 
 /// Upper bound on `pulls/{n}` lookups per `gate pr` (own-branch detection).
@@ -599,6 +603,71 @@ pub fn pull_api_path(html_url: &str) -> Option<String> {
     ))
 }
 
+/// Linked PRs of an issue as GraphQL closing references (§8).
+pub const CLOSING_PRS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(first: 20, includeClosedPrs: true) {
+        nodes { number url state author { login } headRefName merged }
+      }
+    }
+  }
+}
+";
+
+/// `event` of a [`LinkedPr`] found through [`CLOSING_PRS_QUERY`].
+pub const CLOSING_REFERENCE_EVENT: &str = "closing_reference";
+
+/// [`LinkedPr`]s from `closedByPullRequestsReferences.nodes`.
+pub fn parse_closing_prs(nodes: &[Value]) -> Vec<LinkedPr> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let url = node["url"].as_str()?.to_owned();
+            let state = if node["merged"].as_bool() == Some(true) {
+                Some("merged".to_owned())
+            } else {
+                node["state"].as_str().map(str::to_ascii_lowercase)
+            };
+            Some(LinkedPr {
+                url,
+                event: CLOSING_REFERENCE_EVENT.into(),
+                author: node["author"]["login"].as_str().map(str::to_owned),
+                state,
+                head_ref: node["headRefName"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// Adds closing-reference PRs to the timeline's linked PRs: new URLs are
+/// appended, known ones get missing author / state / head branch filled in.
+fn merge_linked_prs(detail: Live<IssueDetail>, closing: Live<Vec<LinkedPr>>) -> Live<IssueDetail> {
+    let as_of = detail.as_of().min(closing.as_of());
+    let mut detail = detail.into_inner();
+    for pr in closing.into_inner() {
+        match detail
+            .linked_prs
+            .iter_mut()
+            .find(|known| known.url == pr.url)
+        {
+            Some(known) => {
+                if known.author.is_none() {
+                    known.author = pr.author;
+                }
+                if known.state.is_none() {
+                    known.state = pr.state;
+                }
+                if known.head_ref.is_none() {
+                    known.head_ref = pr.head_ref;
+                }
+            }
+            None => detail.linked_prs.push(pr),
+        }
+    }
+    Live::new(detail, as_of, false)
+}
+
 /// The default gatekeeper over the live service methods and one [`Gateway`].
 pub struct LiveGatekeeper {
     gateway: Arc<Gateway>,
@@ -674,6 +743,27 @@ impl LiveGatekeeper {
         Ok(Some(response.map(|_| head)))
     }
 
+    /// PRs linked to the issue as closing references (Development sidebar
+    /// links and closing keywords), open or closed: one GraphQL query.
+    /// Sidebar links may leave no usable timeline event, so gates ask for
+    /// them directly. GraphQL has no ETags; this is always a network read.
+    fn closing_prs(&self, issue: &IssueRef) -> Result<Live<Vec<LinkedPr>>> {
+        let variables = json!({
+            "owner": issue.repo.owner(),
+            "name": issue.repo.name(),
+            "number": issue.number,
+        });
+        let response = self.gateway.graphql(CLOSING_PRS_QUERY, &variables)?;
+        let at = Utc::now();
+        let data =
+            graphql_data(&response).with_context(|| format!("closing pull requests of {issue}"))?;
+        let nodes = data
+            .pointer("/repository/issue/closedByPullRequestsReferences/nodes")
+            .and_then(Value::as_array)
+            .with_context(|| format!("GraphQL returned no closing references for {issue}"))?;
+        Ok(Live::new(parse_closing_prs(nodes), at, false))
+    }
+
     fn gather(
         &self,
         kind: GateKind,
@@ -685,6 +775,8 @@ impl LiveGatekeeper {
         let viewer = self.viewer(live)?;
         let repo = self.profiler.profile_live(&issue.repo, live)?;
         let detail = self.indexer.issue_live(issue, live)?;
+        let closing = self.closing_prs(issue)?;
+        let detail = merge_linked_prs(detail, closing);
         let policy_files = self
             .policy_files
             .fetch_live(&issue.repo, live, kind == GateKind::Pr)?;
