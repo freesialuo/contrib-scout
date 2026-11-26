@@ -24,6 +24,7 @@ dwave（`freesialuo/dwave`）已经验证过一套做法：本地 SQLite 共享�
 - **AI 政策标记**：由 Agent 读完原文后写入，按仓库或组织保存，附证据（文件、链接、原文摘录）。以后任何命令访问到这个仓库时都附带提醒。
 - **仓库画像**：元数据、可贡献性指标（外部 PR 合并率、维护者首次回复的中位时间、最近活跃时间）。
 - **issue 索引**：增量同步，候选 issue 在本地筛选。
+- **issue 标记**：Agent 读过某个 issue 后，可以把它标为"不考虑"并写明原因；以后的发现和候选列表默认跳过它，不必再读一遍。
 - **两道实时关卡**：`gate start` 和 `gate pr`，输出原始 GitHub 数据，供 Agent 自己阅读。
 - **多 Agent 协调**：本机只有一个数据库；按 key 只拉一次；配额跨进程共享；认领带租约。
 - 稳定的 `--json` 契约加 skill。核心库的 API 设计成以后能加一层很薄的 MCP。
@@ -160,11 +161,36 @@ struct Evidence { path: String, url: String, excerpt: String /* Agent 摘录的�
 
 **TTL（可配置，默认值偏长）**：Bans 90 天；Restricts / Disclose 30 天；Allows / Welcomes / NoneFound 14 天。过期后标记不会被删除，也不会被改写。提醒照常显示，只是多一个 `review_due: true`，提示 Agent 下次读原文时顺便重新标记。
 
+## 5b. issue 标记（Agent 写入，避免重复阅读）
+
+与仓库政策标记同一个思路，粒度是单个 issue。CLI 不判断，只存储和提醒。
+
+```rust
+enum IssueVerdict { Skip, Shortlist }          // Skip：不考虑；Shortlist：值得做，留给之后的 Agent
+enum SkipReason { TooLarge, Unclear, NeedsSpecialEnv, OutOfScope, Duplicate,
+                  MaintainerUnresponsive, AlreadyAddressed, Other }  // 开放枚举
+struct IssueMark {
+    issue: IssueRef, verdict: IssueVerdict, reason: Option<SkipReason>,
+    note: String,                 // 一句话说明，提醒时原样展示
+    seen_updated_at, seen_comments: u32,   // 标记时 issue 的状态快照，取自本地索引
+    marked_by: AgentId, marked_at, expires_at: Option<Timestamp>,  // 默认不过期
+}
+```
+
+- `issue mark <ref> --verdict skip|shortlist [--reason R] --note T [--until D]`：写入或覆盖；`issue unmark <ref>`。每次写入追加历史。
+- `candidates` 和 `discover` 默认排除 `Skip` 的 issue，并在结果里注明"已排除 N 个"；`--include-marked` 可以显示它们。`Shortlist` 的 issue 排序靠前，并附上标记说明。
+- **变化提示（不额外请求）**：索引同步后，如果 issue 的 `updated_at` 或评论数与标记时的快照不同，在提醒里加 `changed_since_mark: true`。被标为 `Skip` 的 issue 仍然默认排除，只在 `--include-marked` 和 `issue show` 里显示这个提示。是否重读由 Agent 决定。
+- 已关闭、已指派、已有 PR 这些情况由索引自动识别，不需要手动标记。
+- `gate start` 遇到被标为 `Skip` 的 issue，给出 `blocked: issue_skipped`，并附上标记原因。Agent 要先 `issue unmark` 才能继续。
+- 标记只在本机生效，不写到 GitHub。
+
 ## 6. 数据模型（SQLite，按逻辑划分的表）
 
 - `repos`：名称、归档状态、是否 fork、许可证、默认分支、`pushed_at`、star 数、topics、`raw_json`、`etag`、`fetched_at`
 - `policy_marks`：即 `PolicyMark`，主键为 target（仓库或组织）；scope、requirements、evidence 存为 JSON 列；`stance` 和 `expires_at` 建索引
 - `policy_mark_history`：每次 set、unset 都追加一行，用于审计"谁在何时依据什么改了判断"
+- `issue_marks`：即 `IssueMark`，主键为 issue_ref；`verdict` 建索引
+- `issue_mark_history`：每次 mark、unmark 追加一行
 - `repo_activity`：外部 PR 合并率、首次回复中位时间、维护者最近活跃时间、样本量、`computed_at`
 - `issues`：仓库、编号、状态、标签、assignee、评论数、`updated_at`、`raw_json`、`fetched_at`（只存索引字段，正文按需拉取）
 - `sync_state`：每个仓库的 `since` 水位线、上次全量同步时间
@@ -202,6 +228,7 @@ struct Evidence { path: String, url: String, excerpt: String /* Agent 摘录的�
 | 检查项 | start | pr |
 |---|---|---|
 | issue 仍是 open | ✓ | ✓ |
+| issue 未被标为 Skip（否则 `blocked: issue_skipped`） | ✓ | ✓ |
 | 未被指派，或指派给我 | ✓ | ✓ |
 | timeline 中没有别人的关联 PR（cross-referenced / connected 事件） | ✓ | ✓（排除我自己的分支） |
 | 最近评论里没有人认领（启发式判断，只报告不裁决） | ✓ | ✓ |
@@ -239,7 +266,10 @@ contrib-scout policy set <owner/repo|org> --stance S --evidence PATH[:LINES]... 
 contrib-scout policy unset <owner/repo|org>
 contrib-scout policy due                                        # 列出已到 review_due 的标记
 contrib-scout candidates [--min-score N] [--lang L] [--limit N] # 只读本地数据，零请求
-contrib-scout issue show <ref> [--fresh]
+contrib-scout issue show <ref> [--fresh]                       # 附带 issue 标记与仓库标记的提醒
+contrib-scout issue mark <ref> --verdict skip|shortlist [--reason R] --note T [--until D]
+contrib-scout issue unmark <ref>
+contrib-scout issue marks [--verdict V] [--repo R]              # 列出 issue 标记
 contrib-scout gate start <ref> [--agent ID]
 contrib-scout gate pr <ref> [--agent ID] [--branch B]
 contrib-scout claim list | renew <ref> | release <ref>
@@ -269,7 +299,7 @@ JSON 信封沿用 dwave 的格式：`{ "schema": "contrib-scout/v1", "meta": {as
 2. Transport（gh 和夹具实现）、Gateway、Store 和迁移、共享配额、只拉一次的锁。
 3. 政策原文获取、标记存储和历史、提醒注入 `meta.reminders`；`policy files|show|set|unset|due`。
 4. 仓库画像、发现流水线；`discover`、`repo show`、`candidates`。
-5. issue 增量索引；`sync`、`track`。
+5. issue 增量索引和 issue 标记；`sync`、`track`、`issue show|mark|unmark|marks`。
 6. 关卡和认领；`gate start|pr`、`claim`。
 7. skill、README、CI、npm 原生二进制发布。
 
@@ -280,5 +310,6 @@ JSON 信封沿用 dwave 的格式：`{ "schema": "contrib-scout/v1", "meta": {as
 - **跨进程**：两个进程同时请求同一个键，断言只有一次真实请求；配额表跨进程可见；剩余低于阈值时拒绝。
 - **关卡**：网络断开时，`Live` 返回 error 而不是缓存；304 算作通过的实时确认；未标记的仓库返回 `policy_unmarked`；`gate pr` 实时返回政策文件全文。
 - **提醒**：仓库被标记后，`discover`、`candidates`、`repo show`、`issue show` 和两道关卡的输出里都带同一条提醒。组织标记对其下所有仓库生效；仓库标记优先于组织标记。标记为 Bans 的仓库默认被排除，并给出计数。
+- **issue 标记**：Skip 的 issue 默认从 `candidates`、`discover` 中排除并计数；Shortlist 排序靠前；索引更新后出现 `changed_since_mark`；`gate start` 对 Skip 的 issue 返回 `issue_skipped`。
 - **标记写入**：没有证据时拒绝写入；每次写入都追加历史记录；过期不删除标记。
 - **端到端**：用临时数据库跑一遍 `discover → repo show → gate start → gate pr`，检查 `meta.requests` 和 `served_304` 是否符合预期。第二次运行 `candidates` 时请求数应为 0。
