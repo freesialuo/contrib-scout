@@ -5,6 +5,7 @@
 
 use crate::args::Cli;
 use contrib_scout_core::envelope::{Envelope, ErrorInfo, Meta, Page};
+use contrib_scout_core::models::Reminder;
 use contrib_scout_core::policy::human_line;
 use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
@@ -75,12 +76,7 @@ pub fn write(report: &Report, cli: &Cli) -> anyhow::Result<()> {
     } else {
         let color = stdout.is_terminal() && !cli.no_color && std::env::var_os("NO_COLOR").is_none();
         for reminder in &report.meta.reminders {
-            let line = human_line(reminder);
-            if color {
-                writeln!(stdout, "\x1b[1;33m{line}\x1b[0m")?;
-            } else {
-                writeln!(stdout, "{line}")?;
-            }
+            writeln!(stdout, "{}", reminder_line(reminder, color))?;
         }
         if report.human.is_empty() {
             writeln!(stdout, "{}", serde_json::to_string_pretty(&report.data)?)?;
@@ -137,9 +133,47 @@ pub fn write_error(error: &anyhow::Error, json: bool) -> u8 {
     info.exit_code
 }
 
+/// One reminder as a human line. The note and hint are agent-written (and
+/// may quote repository text), so they get the same sanitising as every
+/// other human line; only our own highlight escape is added afterwards.
+fn reminder_line(reminder: &Reminder, color: bool) -> String {
+    let line = clean(&human_line(reminder));
+    if color {
+        format!("\x1b[1;33m{line}\x1b[0m")
+    } else {
+        line
+    }
+}
+
 /// Strips control characters (except newline and tab) from untrusted text.
 pub fn clean(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reminder_lines_strip_terminal_escapes() {
+        let reminder: Reminder = serde_json::from_value(serde_json::json!({
+            "kind": "marked",
+            "repo": "o/r",
+            "stance": "bans",
+            "note": "No AI \x1b]0;pwned\x07\x1b[2J here",
+        }))
+        .unwrap();
+        let plain = reminder_line(&reminder, false);
+        assert!(!plain.chars().any(char::is_control), "{plain:?}");
+        assert!(plain.contains("No AI ]0;pwned[2J here"), "{plain:?}");
+
+        let colored = reminder_line(&reminder, true);
+        let inner = colored
+            .strip_prefix("\x1b[1;33m")
+            .and_then(|rest| rest.strip_suffix("\x1b[0m"))
+            .expect("highlighted");
+        assert_eq!(inner, plain);
+    }
 }
