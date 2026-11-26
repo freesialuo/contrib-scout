@@ -132,9 +132,15 @@ impl Store {
     ///
     /// Runs in one IMMEDIATE transaction, so two processes cannot both take the
     /// last slot of a window. Refusals:
-    /// - [`ScoutError::QuotaReserved`] when the last observed `remaining` is at or
-    ///   below `reserve` and its `reset_at` is still in the future (a snapshot
-    ///   whose reset has passed is stale and ignored);
+    /// - [`ScoutError::QuotaReserved`] when the last observed `remaining`, minus
+    ///   the requests of this resource reserved since that observation and
+    ///   still in flight, is at or below `reserve` and its `reset_at` is still
+    ///   in the future (a snapshot whose reset has passed is stale and ignored).
+    ///   This is an estimate: in-flight requests reserved before the snapshot
+    ///   was observed, and the one-second resolution of the timestamps, are not
+    ///   accounted for, so concurrent agents can overshoot the reserve by
+    ///   about the number of requests in flight at once. The per-minute /
+    ///   per-hour windows bound that overshoot;
     /// - [`ScoutError::WindowLimit`] when `n` more requests would exceed the
     ///   per-minute or per-hour limit over all resources, or the search
     ///   per-minute limit for [`Resource::Search`].
@@ -151,14 +157,26 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Re-read inside the write lock so the check and the insert are atomic.
-        let fresh: Option<(u32, i64)> = tx
+        let fresh: Option<(u32, i64, i64)> = tx
             .query_row(
-                "SELECT remaining, reset_at FROM quota WHERE resource = ?1",
+                "SELECT remaining, reset_at, observed_at FROM quota WHERE resource = ?1",
                 params![resource.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((remaining, reset_at)) = fresh {
+        if let Some((remaining, reset_at, observed_at)) = fresh {
+            // Requests other agents reserved after the snapshot and are still
+            // waiting for (status `NULL`) are not in `remaining` yet. Older
+            // in-flight requests and the per-second granularity of
+            // `observed_at` can still slip through; the all-agent windows
+            // below bound that.
+            let in_flight: u32 = tx.query_row(
+                "SELECT COUNT(*) FROM request_log
+                 WHERE resource = ?1 AND status IS NULL AND at >= ?2",
+                params![resource.as_str(), observed_at],
+                |row| row.get(0),
+            )?;
+            let remaining = remaining.saturating_sub(in_flight);
             if remaining <= reserve && reset_at > now.timestamp() {
                 return Err(ScoutError::QuotaReserved {
                     resource,

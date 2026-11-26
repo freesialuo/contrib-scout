@@ -164,7 +164,7 @@ The gate report (`data`) holds `verdict`, `blocked_by` (`{reason, detail}`), `ob
 |---|---|
 | `track add\|rm <owner/repo>` / `track list` | Repositories refreshed by the scheduled sync |
 | `sync [<owner/repo>...] [--all-tracked] [--max-requests N]` | Incrementally refresh the issue index (`since` watermark with an overlap window) for the given or all tracked repositories |
-| `quota` | Shared quota and window usage across all agents |
+| `quota` | Shared quota and window usage across all agents (requests are refused when the last observed `remaining`, minus requests other agents have in flight since that observation, reaches the reserve: default core 500, search 5, graphql 500. The in-flight count is an estimate at one-second resolution, so concurrent agents can overshoot the reserve by roughly the number of requests in flight at once; the all-agent per-minute and per-hour windows bound that) |
 | `cache stats` / `cache prune [--older-than D]` | Inspect or prune cached data (default `30d`; never marks or history) |
 | `config get <key>` / `config set <key> <value>` | Read or change configuration (for example `claim_lease`, `max_requests`, `mark_ttl_bans`) |
 

@@ -134,6 +134,39 @@ fn quota_is_visible_across_handles() {
     assert!(b.reserve(Resource::Core, 1).is_ok());
 }
 
+#[test]
+fn in_flight_requests_count_against_the_reserve() {
+    let path = temp_db("in-flight");
+    let windows = WindowLimits {
+        per_minute: 100,
+        per_hour: 100,
+        search_per_minute: 100,
+    };
+    let a = coordinator(&path, "agent-a", windows);
+    let b = coordinator(&path, "agent-b", windows);
+    let now = Utc::now();
+    // 503 left, reserve 500: room for three requests.
+    a.observe(&contrib_scout_core::coordinator::QuotaSnapshot {
+        resource: Resource::Core,
+        limit: 5000,
+        remaining: 503,
+        reset_at: now + TimeDelta::minutes(30),
+        observed_at: now,
+    })
+    .unwrap();
+    // Agent a has two requests in flight (reserved, not yet answered).
+    let pending = a.reserve(Resource::Core, 2).unwrap();
+    // b may take the last one, then the reserve is reached.
+    let last = b.reserve(Resource::Core, 1).unwrap();
+    let error = b.reserve(Resource::Core, 1).unwrap_err();
+    assert_eq!(ScoutError::find(&error).unwrap().code(), "quota_reserved");
+    // Answered requests are no longer counted: their responses carry the
+    // newer `x-ratelimit-*` snapshot.
+    a.settle(&pending, Some(200)).unwrap();
+    b.settle(&last, Some(200)).unwrap();
+    assert!(b.reserve(Resource::Core, 1).is_ok());
+}
+
 /// Wraps the fixture with a delay so concurrent fetches really overlap.
 struct Slow(Arc<FixtureTransport>);
 
