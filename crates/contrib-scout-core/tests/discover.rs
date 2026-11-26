@@ -30,13 +30,7 @@ struct FakeIndexer {
 impl IssueIndexer for FakeIndexer {
     fn sync(&self, repo: &RepoName, _mode: Freshness) -> anyhow::Result<SyncReport> {
         self.synced.lock().unwrap().push(repo.to_string());
-        Ok(SyncReport {
-            repo: repo.clone(),
-            updated: 0,
-            new_issues: 0,
-            since: None,
-            partial: false,
-        })
+        Ok(SyncReport::new(repo))
     }
 
     fn issue(&self, _issue: &IssueRef, _mode: Freshness) -> anyhow::Result<IssueDetail> {

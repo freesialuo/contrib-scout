@@ -18,6 +18,7 @@ pub fn reminder_for(repo: &RepoName, mark: Option<&PolicyMark>, now: DateTime<Ut
             evidence_urls: mark.evidence.iter().map(|e| e.url.clone()).collect(),
             review_due: mark.review_due(now),
             hint: None,
+            issue_mark: None,
         },
         None => Reminder {
             kind: ReminderKind::Unmarked,
@@ -32,6 +33,7 @@ pub fn reminder_for(repo: &RepoName, mark: Option<&PolicyMark>, now: DateTime<Ut
             hint: Some(format!(
                 "run `contrib-scout policy files {repo}`, read the text, then record it with `contrib-scout policy set`"
             )),
+            issue_mark: None,
         },
     }
 }
@@ -39,6 +41,9 @@ pub fn reminder_for(repo: &RepoName, mark: Option<&PolicyMark>, now: DateTime<Ut
 /// The prominent human-readable line, e.g.
 /// `⚠ owner/repo: Bans AI — "<note>" (marked 2026-11-20)`.
 pub fn human_line(reminder: &Reminder) -> String {
+    if let Some(issue) = &reminder.issue_mark {
+        return crate::issue_marks::human_line(reminder, issue);
+    }
     match (&reminder.kind, &reminder.stance) {
         (ReminderKind::Marked | ReminderKind::ReviewDue, Some(stance)) => {
             let mut line = format!(

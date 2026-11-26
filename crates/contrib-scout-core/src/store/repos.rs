@@ -4,7 +4,7 @@
 
 use super::{from_unix, Cached, Store};
 use crate::error::Result;
-use crate::models::{AgentId, IssueRef, IssueRow, IssueState, RepoActivity, RepoName, RepoProfile};
+use crate::models::{IssueRef, IssueRow, IssueState, RepoActivity, RepoName, RepoProfile};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension};
@@ -263,46 +263,6 @@ impl Store {
             ],
         )?;
         Ok(())
-    }
-
-    /// Adds to the scheduled-sync set; returns false if already tracked.
-    pub fn track(
-        &mut self,
-        repo: &RepoName,
-        by: Option<&AgentId>,
-        at: DateTime<Utc>,
-    ) -> Result<bool> {
-        let inserted = self.conn.execute(
-            "INSERT INTO tracked_repos (repo, added_by, added_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(repo) DO NOTHING",
-            params![repo.to_string(), by.map(AgentId::as_str), at.timestamp()],
-        )?;
-        Ok(inserted > 0)
-    }
-
-    /// Returns false if it was not tracked.
-    pub fn untrack(&mut self, repo: &RepoName) -> Result<bool> {
-        let deleted = self.conn.execute(
-            "DELETE FROM tracked_repos WHERE repo = ?1",
-            params![repo.to_string()],
-        )?;
-        Ok(deleted > 0)
-    }
-
-    pub fn tracked(&self) -> Result<Vec<RepoName>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT repo FROM tracked_repos ORDER BY repo COLLATE NOCASE")?;
-        let names = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        names
-            .into_iter()
-            .map(|name| {
-                name.parse()
-                    .with_context(|| format!("stored tracked repo {name:?}"))
-            })
-            .collect()
     }
 
     /// Open, unassigned issues from the local index (zero requests), newest

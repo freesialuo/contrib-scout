@@ -1100,6 +1100,8 @@ open_enum! {
         Hint => "hint",
         /// Listing entry for `policy due`.
         ReviewDue => "review_due",
+        /// An agent-written issue mark applies (§5b); details in `Reminder::issue_mark`.
+        IssueMarked => "issue_marked",
     }
 }
 
@@ -1125,4 +1127,7 @@ pub struct Reminder {
     pub review_due: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Set for `issue_marked` reminders (§5b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_mark: Option<crate::issue_marks::IssueMarkReminder>,
 }

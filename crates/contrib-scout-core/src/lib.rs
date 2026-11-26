@@ -20,6 +20,7 @@ pub mod freshness;
 pub mod gate;
 pub mod gateway;
 pub mod index;
+pub mod issue_marks;
 pub mod models;
 pub mod policy;
 pub mod profile;
