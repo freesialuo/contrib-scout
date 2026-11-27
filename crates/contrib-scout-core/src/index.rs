@@ -273,7 +273,12 @@ pub fn safe_api_url(url: &str, suffix: &str) -> bool {
 }
 
 /// Timeline `cross-referenced` / `connected` events add a PR, `disconnected`
-/// removes it (adapted from dwave `apply_pr_event`).
+/// removes it (adapted from dwave `apply_pr_event`), but only while the PR is
+/// linked through the Development sidebar alone: `disconnected` undoes a
+/// `connected` link, never a cross-reference (a mention in a PR body or
+/// commit stays), so once a PR has cross-referenced the issue its `event`
+/// stays `cross-referenced` in any order of events. Later events fill in an
+/// author or state but never erase one.
 ///
 /// Two shapes occur. `cross-referenced` carries the PR as an issue object in
 /// `source.issue` (with a `pull_request` key, `html_url`, `user`). Real
@@ -289,18 +294,28 @@ pub fn apply_pr_event(event: &Value, prs: &mut BTreeMap<String, LinkedPr>) {
     };
     match event["event"].as_str() {
         Some(name @ ("cross-referenced" | "connected")) => {
-            prs.insert(
-                found.url.clone(),
-                LinkedPr {
-                    url: found.url,
-                    event: name.to_owned(),
-                    author: found.author,
-                    state: found.state,
-                    head_ref: None,
-                },
-            );
+            let pr = prs.entry(found.url.clone()).or_insert_with(|| LinkedPr {
+                url: found.url,
+                event: name.to_owned(),
+                author: None,
+                state: None,
+                head_ref: None,
+            });
+            if name == "cross-referenced" {
+                pr.event = name.to_owned();
+            }
+            if found.author.is_some() {
+                pr.author = found.author;
+            }
+            if found.state.is_some() {
+                pr.state = found.state;
+            }
         }
-        Some("disconnected") => {
+        Some("disconnected")
+            if prs
+                .get(&found.url)
+                .is_some_and(|pr| pr.event == "connected") =>
+        {
             prs.remove(&found.url);
         }
         _ => {}

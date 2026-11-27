@@ -534,8 +534,14 @@ fn detail_reads_comments_and_timeline_prs_across_pages() {
     assert_eq!(detail.author.as_deref(), Some("reporter"));
     let bodies: Vec<_> = detail.comments.iter().map(|c| c.body.as_str()).collect();
     assert_eq!(bodies, ["comment 2", "comment 3"]);
-    assert_eq!(detail.linked_prs.len(), 1, "PR 10 was disconnected");
+    // PR 10 cross-referenced the issue; a later `disconnected` does not undo that.
+    assert_eq!(detail.linked_prs.len(), 2, "{:?}", detail.linked_prs);
     let pr = &detail.linked_prs[0];
+    assert_eq!(pr.url, "https://github.com/o/r/pull/10");
+    assert_eq!(pr.event, "cross-referenced");
+    assert_eq!(pr.state.as_deref(), Some("open"));
+    assert_eq!(pr.author.as_deref(), Some("someone"));
+    let pr = &detail.linked_prs[1];
     assert_eq!(pr.url, "https://github.com/o/r/pull/11");
     assert_eq!(pr.event, "cross-referenced");
     assert_eq!(pr.state.as_deref(), Some("merged"));
@@ -618,7 +624,7 @@ fn issue_live_revalidates_and_never_falls_back_to_cache() {
     let live = Freshness::Live.live().unwrap();
     let detail = h.indexer.issue_live(&issue_ref(9), live).unwrap();
     assert!(detail.not_modified());
-    assert_eq!(detail.get().linked_prs.len(), 1);
+    assert_eq!(detail.get().linked_prs.len(), 2);
     let revalidation = h.fixture.requests()[5..].to_vec();
     assert!(revalidation.iter().all(|r| match r {
         Recorded::Get(request) => request.if_none_match.is_some(),
@@ -677,6 +683,59 @@ fn real_shape_sidebar_events_link_and_unlink_prs() {
         &mut prs,
     );
     assert_eq!(prs.len(), 1);
+}
+
+/// A `cross-referenced` event for `cli/cli#number`, opened by `someone`.
+fn cli_cross_reference(number: u64) -> Value {
+    json!({
+        "event": "cross-referenced",
+        "source": {"issue": {
+            "number": number,
+            "state": "open",
+            "user": {"login": "someone"},
+            "html_url": format!("https://github.com/cli/cli/pull/{number}"),
+            "pull_request": {
+                "html_url": format!("https://github.com/cli/cli/pull/{number}"),
+                "merged_at": Value::Null,
+            },
+        }},
+    })
+}
+
+#[test]
+fn disconnect_only_undoes_a_sidebar_link_not_a_cross_reference() {
+    use contrib_scout_core::index::apply_pr_event;
+    const URL: &str = "https://github.com/cli/cli/pull/15070";
+    let cross = cli_cross_reference(15070);
+    let connected = sidebar_event("connected", 15070, "open", false);
+    let disconnected = sidebar_event("disconnected", 15070, "open", false);
+    let fold = |events: &[&Value]| {
+        let mut prs = std::collections::BTreeMap::new();
+        for event in events {
+            apply_pr_event(event, &mut prs);
+        }
+        prs
+    };
+
+    // A cross-reference cannot be undone, whichever order the events come in.
+    for events in [
+        [&cross, &connected, &disconnected],
+        [&connected, &cross, &disconnected],
+        [&cross, &disconnected, &connected],
+    ] {
+        let prs = fold(&events);
+        assert_eq!(prs.len(), 1, "{prs:?}");
+        let pr = &prs[URL];
+        assert_eq!(pr.event, "cross-referenced");
+        assert_eq!(pr.author.as_deref(), Some("someone"), "{events:?}");
+        assert_eq!(pr.state.as_deref(), Some("open"));
+    }
+
+    // A sidebar-only link is undone, and a later `connected` links it again.
+    assert!(fold(&[&connected, &disconnected]).is_empty());
+    let prs = fold(&[&connected, &disconnected, &connected]);
+    assert_eq!(prs[URL].event, "connected");
+    assert_eq!(prs[URL].state.as_deref(), Some("open"));
 }
 
 #[test]
