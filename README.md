@@ -321,7 +321,7 @@ If the repository variable `NPM_TRUSTED_PUBLISHING_ENABLED` is not `true`, the r
 
 One-time setup:
 
-- On npmjs.com, add a trusted publisher to `@freesialuo/contrib-scout`: GitHub Actions, this repository, workflow `release.yml`, environment `npm`.
+- On npmjs.com, add a trusted publisher to `@freesialuo/contrib-scout`: GitHub Actions, this repository, workflow `release.yml`, environment `npm`. Under **Allowed actions**, enable direct `npm publish`: configurations created after Sep 3, 2026 allow only `npm stage publish` by default, and the **publish** job runs `npm publish`.
 - In the repository settings, create an environment named `npm` with required reviewers, and set the variable `NPM_TRUSTED_PUBLISHING_ENABLED` to `true`.
 - Leave the workflow permissions default read-only. Only the **draft** and **release** jobs request `contents: write`, and only **publish** requests `id-token: write`.
 
