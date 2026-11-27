@@ -780,6 +780,37 @@ fn real_shape_connected_event_blocks() {
 }
 
 #[test]
+fn cross_referenced_pr_still_blocks_after_a_sidebar_disconnect() {
+    let h = harness();
+    put_mark(&h, |_| {});
+    let mut disconnected = connected_pr(12, "open");
+    disconnected["event"] = json!("disconnected");
+    let spec = Spec {
+        timeline: vec![
+            linked_pr(12, "someone", "open"),
+            connected_pr(12, "open"),
+            disconnected.clone(),
+        ],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a1");
+    assert_eq!(reasons(&report), [BlockReason::PrExists]);
+    assert!(
+        report.blocked_by[0].detail.contains("someone"),
+        "{:?}",
+        report.blocked_by
+    );
+
+    // A sidebar-only link that was disconnected no longer blocks.
+    let spec = Spec {
+        timeline: vec![connected_pr(12, "open"), disconnected],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a2");
+    assert_eq!(report.verdict, GateVerdict::Pass, "{:?}", report.blocked_by);
+}
+
+#[test]
 fn closing_reference_graphql_errors_fail_closed() {
     let h = harness();
     put_mark(&h, |_| {});
