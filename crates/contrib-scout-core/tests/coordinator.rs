@@ -13,15 +13,22 @@ use contrib_scout_core::transport::{ApiRequest, ApiResponse, FixtureTransport, T
 use contrib_scout_core::{Freshness, ScoutError};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
+/// A fresh database path per call. The counter keeps parallel tests of one
+/// run apart (the clock alone is not enough: on macOS it has microsecond
+/// resolution, and both single-flight tests use the name "flight"); pid and
+/// time keep runs apart.
 fn temp_db(name: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!(
-            "{name}-{}-{}",
+            "{name}-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             Utc::now().timestamp_nanos_opt().unwrap()
         ))
         .join("scout.db")
