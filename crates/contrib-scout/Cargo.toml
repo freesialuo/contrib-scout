@@ -2,6 +2,7 @@
 name = "contrib-scout"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Find open-source issues that accept outside contributions, shared safely across many agents"

@@ -47,6 +47,8 @@ The `@freesialuo/contrib-scout` package bundles prebuilt native binaries for:
 
 ### From source (Rust)
 
+Building from source requires Rust 1.95 or newer (`rust-version` in `Cargo.toml`). Check with `rustc --version`. With rustup, update using `rustup update stable`. Older toolchains stop with `rustc 1.xx is not supported by the following packages: ... requires rustc 1.95`.
+
 ```sh
 git clone https://github.com/freesialuo/contrib-scout.git
 cd contrib-scout
