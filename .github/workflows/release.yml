@@ -1,4 +1,6 @@
-name: Release to npm
+# One tag, one set of tested bytes: the GitHub Release is staged as a draft first, npm is
+# published second, and the draft is made public only after npm holds the same tarball.
+name: Release
 
 on:
   push:
@@ -10,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: npm-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +33,7 @@ jobs:
           node-version: '22'
           package-manager-cache: false
       - name: Test release decisions offline
-        run: node --test scripts/npm-release.test.mjs
+        run: node --test scripts/*.test.mjs
       - name: Match tag, npm version, and Rust workspace versions
         id: validate
         run: node scripts/npm-release.mjs validate "$GITHUB_REF_NAME"
@@ -87,14 +89,63 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           overwrite: true
-      - name: Report artifact-only release
+      - name: Build GitHub Release assets from the tested binaries and tarball
+        run: node scripts/github-release.mjs assets "$GITHUB_REF_NAME" "$RUNNER_TEMP/native-binaries" "$RUNNER_TEMP/$TARBALL" "$RUNNER_TEMP/release-assets"
+      - name: Smoke test the release archives
+        working-directory: ${{ runner.temp }}/release-assets
+        run: |
+          sha256sum --check --strict SHA256SUMS
+          name="contrib-scout-$GITHUB_REF_NAME-linux-x64"
+          tar -xzf "$name.tar.gz" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/$name/contrib-scout" --version)" = "contrib-scout $VERSION"
+          unzip -tq "contrib-scout-$GITHUB_REF_NAME-win32-x64.zip"
+      - name: Upload GitHub Release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+  draft:
+    name: Stage the GitHub Release as a draft
+    needs: pack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+      # Drafts are private, so a draft left by an earlier run is repaired to match these assets.
+      - name: Create, repair, or verify the draft release
+        run: node scripts/github-release.mjs draft "$GITHUB_REF_NAME" "$RUNNER_TEMP/release-assets"
+      - name: Report draft-only release
         if: ${{ vars.NPM_TRUSTED_PUBLISHING_ENABLED != 'true' }}
         run: |
-          echo 'Trusted publishing is disabled. The verified tarball is available in the `npm-package` artifact.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo 'npm trusted publishing is disabled (`NPM_TRUSTED_PUBLISHING_ENABLED` is not `true`), so nothing was made public.'
+            echo "The GitHub Release for \`$GITHUB_REF_NAME\` stays a **draft** holding the tested assets; the verified tarball is also in the \`npm-package\` artifact."
+            echo 'Enable the variable and re-run all jobs of this workflow to publish npm and the GitHub Release together.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: Publish tested tarball via npm trusted publishing
-    needs: [version, pack]
+    needs: [version, pack, draft]
     if: ${{ vars.NPM_TRUSTED_PUBLISHING_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -123,3 +174,29 @@ jobs:
           path: ${{ runner.temp }}/npm-package
       - name: Publish or verify an identical existing release
         run: node scripts/npm-release.mjs publish "$GITHUB_REF_NAME" "$RUNNER_TEMP/npm-package/$TARBALL" "$EXPECTED_INTEGRITY"
+
+  release:
+    name: Publish the GitHub Release
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+      - name: Verify the draft still holds the tested assets, then publish it
+        run: node scripts/github-release.mjs publish "$GITHUB_REF_NAME" "$RUNNER_TEMP/release-assets"
