@@ -299,7 +299,7 @@ The Cargo workspace separates the library [`crates/contrib-scout-core`](crates/c
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-node --test scripts/npm-release.test.mjs
+node --test scripts/*.test.mjs
 ```
 
 Changes to the `contrib-scout/v1` JSON structure should stay backwards compatible for scripts and the skill.
