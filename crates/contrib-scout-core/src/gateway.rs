@@ -119,7 +119,7 @@ impl Budget {
     /// Spends one unit or fails with [`ScoutError::BudgetExhausted`].
     pub fn try_spend(&self) -> Result<(), ScoutError> {
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < self.limit).then_some(used + 1)
             })
             .map(|_| ())
@@ -130,7 +130,7 @@ impl Budget {
     fn refund(&self) {
         let _ = self
             .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 used.checked_sub(1)
             });
     }

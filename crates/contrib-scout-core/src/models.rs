@@ -431,8 +431,10 @@ impl Stance {
 
 open_enum! {
     /// How strongly one part of the contribution is restricted.
+    #[derive(Default)]
     Restriction, "restriction" {
         /// The policy says nothing about this part.
+        #[default]
         Unspecified => "unspecified",
         Allowed => "allowed",
         /// Allowed if AI use is declared.
@@ -440,12 +442,6 @@ open_enum! {
         /// Must be written by a human.
         HumanWritten => "human_written",
         Forbidden => "forbidden",
-    }
-}
-
-impl Default for Restriction {
-    fn default() -> Self {
-        Self::Unspecified
     }
 }
 
