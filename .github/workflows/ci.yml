@@ -27,11 +27,25 @@ jobs:
           node-version: '22'
           package-manager-cache: false
       - name: Test release decisions offline
-        run: node --test scripts/npm-release.test.mjs
+        run: node --test scripts/*.test.mjs
       - name: Install Rust tools
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
       - run: cargo +stable fmt --all --check
       - run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+      # Keep in sync with rust-version in Cargo.toml.
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal --no-self-update
+      - run: cargo +1.95 check --locked --workspace --all-targets
 
   native:
     name: Native tests and npm smoke

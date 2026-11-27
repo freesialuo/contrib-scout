@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parseRelease, publishOnce } from './npm-release-decisions.mjs';
+import { assertNotDiverged, parseRelease, publishOnce } from './npm-release-decisions.mjs';
 
 test('rejects malformed tags, leading zeroes, and build metadata', () => {
   for (const tag of ['1.2.3', 'v1.2', 'v01.2.3', 'v1.2.3-rc.01', 'v1.2.3+local', 'v1.2.3\n']) {
@@ -61,4 +61,11 @@ test('surfaces a failed publish when the version remains absent', async t => {
   await assert.rejects(publishOnce({ packageVersion, integrity, lookup, publish }), /npm publish failed for @freesialuo\/contrib-scout@1\.2\.3 \(exit 42\)/);
   assert.equal(lookup.mock.callCount(), 2);
   assert.equal(publish.mock.callCount(), 1);
+});
+
+test('refuses to stage GitHub assets that npm can no longer match', async () => {
+  const check = existing => assertNotDiverged({ packageVersion: 'pkg@1.0.0', integrity: 'sha512-a', lookup: async () => existing });
+  assert.equal(await check(null), 'unpublished');
+  assert.equal(await check('sha512-a'), 'already-published');
+  await assert.rejects(check('sha512-b'), /already exists with a different tarball/);
 });

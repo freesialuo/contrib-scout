@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, createReadStream, readFileSync } from 'node:fs';
 import { basename } from 'node:path';
-import { parseRelease, publishOnce } from './npm-release-decisions.mjs';
+import { assertNotDiverged, parseRelease, publishOnce } from './npm-release-decisions.mjs';
 
 const root = new URL('../', import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL('npm/package.json', root), 'utf8'));
@@ -103,11 +103,17 @@ if (operation === 'validate') {
 } else if (operation === 'verify' && archive) {
   const integrity = await verifyPackage(archive, release);
   output({ integrity });
+} else if (operation === 'check' && archive) {
+  // `archive` holds the expected integrity here: check TAG INTEGRITY.
+  const state = await assertNotDiverged({
+    packageVersion: `${manifest.name}@${release.version}`, integrity: archive, lookup: () => publishedIntegrity(release.version),
+  });
+  console.log(`${manifest.name}@${release.version} is ${state} on npm.`);
 } else if (operation === 'publish' && archive && expectedIntegrity) {
   if (!process.env.GITHUB_REPOSITORY) throw new Error('Publishing requires the GitHub repository context');
   const integrity = await verifyPackage(archive, release);
   if (integrity !== expectedIntegrity) throw new Error('Release tarball differs from the verified tarball');
   await publish(archive, release, integrity);
 } else {
-  throw new Error('Usage: node scripts/npm-release.mjs validate TAG | verify TAG TARBALL | publish TAG TARBALL INTEGRITY');
+  throw new Error('Usage: node scripts/npm-release.mjs validate TAG | verify TAG TARBALL | check TAG INTEGRITY | publish TAG TARBALL INTEGRITY');
 }

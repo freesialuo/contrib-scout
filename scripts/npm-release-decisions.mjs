@@ -12,6 +12,15 @@ export function parseRelease(tag, expectedVersion) {
   return { version, dist_tag: prerelease ? 'next' : 'latest' };
 }
 
+// Before staging GitHub assets: an npm version that already holds other bytes can never match them.
+export async function assertNotDiverged({ packageVersion, integrity, lookup }) {
+  const existing = await lookup();
+  if (existing !== null && existing !== integrity) {
+    throw new Error(`${packageVersion} already exists with a different tarball; re-run only the failed jobs of the original release run`);
+  }
+  return existing === null ? 'unpublished' : 'already-published';
+}
+
 export async function publishOnce({ packageVersion, integrity, lookup, publish }) {
   let existing = await lookup();
   if (existing === null) {

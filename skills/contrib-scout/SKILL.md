@@ -11,7 +11,7 @@ Use this skill when asked to find open-source issues to work on, to check whethe
 
 ## Setup
 
-- Check `contrib-scout --version`. If missing: `npm install -g @freesialuo/contrib-scout` (Node.js 22+), or `cargo install --path crates/contrib-scout` from `https://github.com/freesialuo/contrib-scout`.
+- Check `contrib-scout --version`. If missing: `npm install -g @freesialuo/contrib-scout` (Node.js 22+), or `cargo install --path crates/contrib-scout` (Rust 1.95+) from `https://github.com/freesialuo/contrib-scout`.
 - It needs an authenticated GitHub CLI: if a command fails on auth, check `gh auth status` and ask the user to run `gh auth login`. Do not handle tokens yourself.
 - Use a stable agent id for the whole task: `--agent <ID>` on every call, or `CONTRIB_SCOUT_AGENT`. Claims and mark history are recorded under it.
 - **Always pass `--json`** and read the `contrib-scout/v1` envelope: `data`, `meta.reminders`, `meta.partial`, `meta.warnings`, `meta.quota`, and `error` on failure. Use `contrib-scout <command> --help` if a flag is unclear.
