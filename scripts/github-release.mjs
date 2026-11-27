@@ -110,7 +110,7 @@ async function publish(tag, prerelease, directory) {
   if (plan.action !== 'none') throw new Error(`GitHub Release ${tag} must hold the tested assets before publishing`);
 
   if (plan.draft) {
-    gh(['release', 'edit', tag, '--draft=false', `--prerelease=${prerelease}`], { stdio: 'inherit' });
+    gh(['release', 'edit', tag, '--draft=false', '--verify-tag', `--prerelease=${prerelease}`], { stdio: 'inherit' });
   }
   const [release] = await remoteReleases(tag);
   if (!release || release.draft || !sameAssets(release.assets, local)) throw new Error(`GitHub Release ${tag} did not publish cleanly`);

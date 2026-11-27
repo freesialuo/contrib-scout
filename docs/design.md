@@ -293,7 +293,7 @@ JSON 信封沿用 dwave 的格式：`{ "schema": "contrib-scout/v1", "meta": {as
 1. **传输层**：使用 `GhTransport`（`gh api -i` 子进程，认证和代理设置完全交给 gh）。`HttpTransport`（reqwest 加 `gh auth token`）作为备选，大批量同步时更快。
 2. **外部政策清单**：不导入，当前也不提供导入命令。提醒类型中保留 `hint`，以后若加入导入功能，导入结果只作为 `hint` 类提醒（"某公开清单称该仓库禁止 AI"），不算正式标记；Agent 仍需阅读原文后自己执行 `policy set`。
 3. **gh 扩展别名**：不做。以后如有需要，再加一个薄壳仓库 `gh-contrib-scout`。
-4. **`gate pr` 对 CLA 和 DCO**：只报告，不裁决。
+4. **`gate pr` 对 CLA 和 DCO**：不检查，也不裁决。如政策原文有此要求，由 Agent 阅读后自行遵守。
 
 ## 12. 交付顺序（每一步都能编译、能测试）
 

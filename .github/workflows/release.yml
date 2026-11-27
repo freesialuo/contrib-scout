@@ -118,6 +118,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      EXPECTED_INTEGRITY: ${{ needs.pack.outputs.integrity }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,6 +132,9 @@ jobs:
         with:
           name: release-assets
           path: ${{ runner.temp }}/release-assets
+      # A rebuilt run must not replace the draft's assets once npm holds a different tarball.
+      - name: Refuse assets that npm can no longer match
+        run: node scripts/npm-release.mjs check "$GITHUB_REF_NAME" "$EXPECTED_INTEGRITY"
       # Drafts are private, so a draft left by an earlier run is repaired to match these assets.
       - name: Create, repair, or verify the draft release
         run: node scripts/github-release.mjs draft "$GITHUB_REF_NAME" "$RUNNER_TEMP/release-assets"
