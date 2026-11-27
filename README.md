@@ -304,12 +304,30 @@ Changes to the `contrib-scout/v1` JSON structure should stay backwards compatibl
 
 ## Releasing
 
-Tag pushes matching `vX.Y.Z` or `vX.Y.Z-<prerelease>` (no build metadata) trigger [`.github/workflows/release.yml`](.github/workflows/release.yml):
+Tag pushes matching `vX.Y.Z` or `vX.Y.Z-<prerelease>` (no build metadata) trigger the **Release** workflow, [`.github/workflows/release.yml`](.github/workflows/release.yml). It ships the GitHub Release and the npm package together, from the same tested bytes:
 
-1. Set `[workspace.package].version` in `Cargo.toml` and `"version"` in `npm/package.json` to the same SemVer string, refresh `Cargo.lock` (`cargo check --workspace`), run the checks above, and `node scripts/npm-release.mjs validate vX.Y.Z`.
+1. **version** checks that the tag, `npm/package.json`, and every Cargo workspace package agree, and runs `node --test scripts/*.test.mjs`.
+2. **native** builds and tests release binaries for all five targets.
+3. **pack** stages and packs `@freesialuo/contrib-scout`, verifies its contents and SHA-512 integrity, smoke-installs it offline, then builds the GitHub Release assets from the same binaries: `contrib-scout-vX.Y.Z-<target>.tar.gz` (`.zip` for `win32-x64`, each holding the binary, README, and licenses), the exact npm tarball, and `SHA256SUMS`.
+4. **draft** creates the GitHub Release as a **draft** with those assets and generated notes (marked prerelease when the tag has a `-` suffix).
+5. **publish** publishes the tarball through npm trusted publishing (OIDC, with provenance). Stable versions go to dist-tag `latest`, prereleases to `next`. The `npm` environment requires a maintainer's approval under **Review deployments**.
+6. **release** re-checks the draft's assets and makes it public only after npm holds the same tarball.
+
+Every step can be re-run. An existing npm version passes only if its tarball is byte-identical. An existing draft is repaired to match the run's assets; it is private, and it is only made public after npm matches. A published GitHub Release is never changed: re-running against it passes only if its assets are identical, and fails otherwise. After a partial failure, use **Re-run failed jobs** so the run reuses its own artifacts.
+
+If the repository variable `NPM_TRUSTED_PUBLISHING_ENABLED` is not `true`, the run stops after **draft**. Nothing becomes public, so GitHub and npm cannot diverge. The run summary notes this, and the verified tarball stays available in the `npm-package` artifact. Once you set the variable, re-run the workflow (or finish the release by hand).
+
+One-time setup:
+
+- On npmjs.com, add a trusted publisher to `@freesialuo/contrib-scout`: GitHub Actions, this repository, workflow `release.yml`, environment `npm`.
+- In the repository settings, create an environment named `npm` with required reviewers, and set the variable `NPM_TRUSTED_PUBLISHING_ENABLED` to `true`.
+- Leave the workflow permissions default read-only. Only the **draft** and **release** jobs request `contents: write`, and only **publish** requests `id-token: write`.
+
+To cut a release:
+
+1. Set `[workspace.package].version` in `Cargo.toml` and `"version"` in `npm/package.json` to the same SemVer string. Refresh `Cargo.lock` (`cargo check --workspace`), run the checks above, and run `node scripts/npm-release.mjs validate vX.Y.Z`.
 2. Create a signed commit and a matching signed tag, then push both: `git tag -s vX.Y.Z -m "vX.Y.Z"` and `git push origin main vX.Y.Z`.
-3. GitHub Actions builds and tests all five native targets, packs `@freesialuo/contrib-scout`, verifies the archive contents and SHA-512 integrity, uploads the `npm-package` artifact, and publishes through npm trusted publishing (OIDC, with provenance) when the repository variable `NPM_TRUSTED_PUBLISHING_ENABLED` is `true`. Stable versions go to dist-tag `latest`, prereleases to `next`. Rerunning a tag is a no-op only if the registry tarball is byte-identical.
-4. The `npm` environment requires a maintainer's approval under **Review deployments** before the publish job runs.
+3. Approve the `npm` deployment when the run asks for it.
 
 ## License
 
