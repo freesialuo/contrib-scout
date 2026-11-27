@@ -52,6 +52,8 @@ npm only accepts a trusted publisher for a package that already exists, so the f
    npm publish freesialuo-contrib-scout-X.Y.Z.tgz --access public
    ```
 
+   For a prerelease version (`X.Y.Z-rc.1`), npm requires an explicit dist-tag: add `--tag next`, which is what the workflow uses for prereleases.
+
    A new package can take a few minutes to appear. npm may first show a `0.0.0-stage` placeholder version; it is harmless once `latest` points to the real version. A version published by hand carries no provenance.
 4. Add the trusted publisher (from the CLI, or under the package's **Settings → Trusted publishing** on npmjs.com):
 
@@ -75,3 +77,13 @@ npm only accepts a trusted publisher for a package that already exists, so the f
    ```
 
 From the next version on, pushing a tag releases to both GitHub and npm.
+
+The trusted publisher from step 4 expires if no trusted publish uses it within 2 days of its creation; the manual publish in step 3 does not count. Push the next release tag within those 2 days, or, if it has expired, recreate it before the next tag:
+
+```sh
+npm trust list @freesialuo/contrib-scout
+npm trust revoke @freesialuo/contrib-scout --id <id>
+npm trust github @freesialuo/contrib-scout --repo freesialuo/contrib-scout --file release.yml --env npm --allow-publish
+```
+
+and push the next tag within 2 days of recreating it.

@@ -91,15 +91,15 @@ Pass `--json` for a machine-readable `contrib-scout/v1` envelope; every command 
 
 ## Documentation
 
-- [CLI reference](docs/cli.md): every command and option, the JSON envelope, gate verdicts, and exit codes.
-- [Running contrib-scout](docs/operations.md): scheduling a periodic sync, where data is stored, and what contrib-scout does not do.
-- [Releasing](docs/releasing.md): the GitHub and npm release pipeline.
-- [Design](docs/design.md) (Chinese): architecture, data model, and the reasoning behind marks and gates.
-- [Agent skill](skills/contrib-scout/SKILL.md): tells Claude agents how to drive `contrib-scout`.
+- [CLI reference](https://github.com/freesialuo/contrib-scout/blob/main/docs/cli.md): every command and option, the JSON envelope, gate verdicts, and exit codes.
+- [Running contrib-scout](https://github.com/freesialuo/contrib-scout/blob/main/docs/operations.md): scheduling a periodic sync, where data is stored, and what contrib-scout does not do.
+- [Releasing](https://github.com/freesialuo/contrib-scout/blob/main/docs/releasing.md): the GitHub and npm release pipeline.
+- [Design](https://github.com/freesialuo/contrib-scout/blob/main/docs/design.md) (Chinese): architecture, data model, and the reasoning behind marks and gates.
+- [Agent skill](https://github.com/freesialuo/contrib-scout/blob/main/skills/contrib-scout/SKILL.md): tells Claude agents how to drive `contrib-scout`.
 
 ## Development
 
-The Cargo workspace separates the library [`crates/contrib-scout-core`](crates/contrib-scout-core) from the CLI [`crates/contrib-scout`](crates/contrib-scout). All tests run offline against a fixture transport; one live smoke test is `#[ignore]`d.
+The Cargo workspace separates the library [`crates/contrib-scout-core`](https://github.com/freesialuo/contrib-scout/tree/main/crates/contrib-scout-core) from the CLI [`crates/contrib-scout`](https://github.com/freesialuo/contrib-scout/tree/main/crates/contrib-scout). All tests run offline against a fixture transport; one live smoke test is `#[ignore]`d.
 
 ```sh
 cargo fmt --all --check

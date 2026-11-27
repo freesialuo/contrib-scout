@@ -6,7 +6,13 @@ How to keep the shared index fresh, where contrib-scout keeps its data, and what
 
 There is no daemon. A scheduled `sync --all-tracked` is the single background writer; agents then read with the default TTLs or `--offline`. Exit code `10` (new changes) is a success for a scheduler.
 
-**Linux / macOS (cron)**, every 30 minutes:
+**Linux / macOS (cron)**, every 30 minutes. The job's output redirect fails, and the sync never runs, if the log directory is missing, so create it first:
+
+```sh
+mkdir -p "$HOME/.local/state"
+```
+
+Then add the job:
 
 ```cron
 */30 * * * * /usr/local/bin/contrib-scout --agent scheduler sync --all-tracked --max-requests 200 >> "$HOME/.local/state/contrib-scout-sync.log" 2>&1
