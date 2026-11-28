@@ -159,13 +159,19 @@ impl Store {
         agent: &AgentId,
         at: DateTime<Utc>,
     ) -> Result<Option<IssueMark>> {
-        let existing = self.issue_mark(issue)?;
-        if existing.is_none() {
-            return Ok(None);
-        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Read under the write lock, so the history row holds what is deleted.
+        let sql = format!("SELECT {COLUMNS} FROM issue_marks WHERE issue_ref = ?1");
+        let existing = tx
+            .query_row(&sql, params![issue.to_string()], raw_mark)
+            .optional()?
+            .map(RawMark::into_mark)
+            .transpose()?;
+        if existing.is_none() {
+            return Ok(None);
+        }
         tx.execute(
             "DELETE FROM issue_marks WHERE issue_ref = ?1",
             params![issue.to_string()],

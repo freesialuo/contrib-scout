@@ -82,20 +82,24 @@ fn set_overwrites_and_unset_keeps_history() {
     assert_eq!(store.mark(&target).unwrap(), None);
     assert_eq!(store.delete_mark(&target, &agent, at(5)).unwrap(), None);
 
+    // Unsetting nothing deletes nothing and records nothing.
     let history = store.mark_history(&target).unwrap();
     let actions: Vec<_> = history.iter().map(|event| event.action.clone()).collect();
     assert_eq!(
         actions,
-        [
-            MarkAction::Set,
-            MarkAction::Set,
-            MarkAction::Unset,
-            MarkAction::Unset
-        ]
+        [MarkAction::Set, MarkAction::Set, MarkAction::Unset]
     );
     assert_eq!(history[2].agent, agent);
     assert_eq!(history[2].mark.as_ref().unwrap().stance, Stance::Restricts);
-    assert!(history[3].mark.is_none());
+}
+
+#[test]
+fn unset_of_a_never_marked_target_writes_no_history() {
+    let mut store = Store::memory().unwrap();
+    let target: MarkTarget = "acme".parse().unwrap();
+    let agent: AgentId = "agent-b".parse().unwrap();
+    assert_eq!(store.delete_mark(&target, &agent, at(1)).unwrap(), None);
+    assert!(store.mark_history(&target).unwrap().is_empty());
 }
 
 #[test]
