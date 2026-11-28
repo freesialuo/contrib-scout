@@ -118,19 +118,25 @@ fn machine(output: &mut impl Write, report: &Report, data: &Value) -> anyhow::Re
 pub fn write_error(error: &anyhow::Error, json: bool) -> u8 {
     let info = ErrorInfo::from_error(error);
     if json {
-        let meta = Meta {
-            as_of: Some(chrono::Utc::now()),
-            ..Meta::default()
-        };
-        let envelope = Envelope::failure(meta, error);
-        if let Ok(text) = serde_json::to_string(&envelope) {
-            let mut stdout = io::stdout().lock();
-            let _ = writeln!(stdout, "{text}");
-            let _ = stdout.flush();
-        }
+        write_error_envelope(error);
     }
     eprintln!("error: {}", clean(&info.message));
     info.exit_code
+}
+
+/// Writes only the error envelope to stdout, for callers that report the
+/// message on stderr themselves (clap's argument errors).
+pub fn write_error_envelope(error: &anyhow::Error) {
+    let meta = Meta {
+        as_of: Some(chrono::Utc::now()),
+        ..Meta::default()
+    };
+    let envelope = Envelope::failure(meta, error);
+    if let Ok(text) = serde_json::to_string(&envelope) {
+        let mut stdout = io::stdout().lock();
+        let _ = writeln!(stdout, "{text}");
+        let _ = stdout.flush();
+    }
 }
 
 /// One reminder as a human line. The note and hint are agent-written (and

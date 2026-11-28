@@ -379,8 +379,10 @@ impl EvidenceResolver<'_> {
         let owner = self.target.owner();
         let org_repo = RepoName::new(owner, ".github")?;
         let prefix = format!("{owner}/.github/");
-        if path.len() > prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(&prefix) {
-            return Ok(vec![(org_repo, path[prefix.len()..].to_owned())]);
+        if let Some((head, rest)) = path.split_at_checked(prefix.len()) {
+            if !rest.is_empty() && head.eq_ignore_ascii_case(&prefix) {
+                return Ok(vec![(org_repo, rest.to_owned())]);
+            }
         }
         let path = path.trim_start_matches("./").to_owned();
         Ok(match self.target {

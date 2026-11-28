@@ -11,7 +11,7 @@ use serde_json::json;
 #[derive(Args, Debug)]
 pub struct CandidatesArgs {
     /// Minimum score (0-100; shortlisted issues are always shown).
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", value_parser = parse_min_score)]
     pub min_score: Option<f64>,
     /// Primary language.
     #[arg(long, value_name = "L")]
@@ -22,6 +22,16 @@ pub struct CandidatesArgs {
     /// Do not exclude repositories marked as banning AI or skip-marked issues.
     #[arg(long)]
     pub include_marked: bool,
+}
+
+/// `--min-score`: a finite number in 0-100.
+fn parse_min_score(value: &str) -> Result<f64, String> {
+    let score: f64 = value.parse().map_err(|e| format!("{e}"))?;
+    if score.is_finite() && (0.0..=100.0).contains(&score) {
+        Ok(score)
+    } else {
+        Err("expected a number from 0 to 100".into())
+    }
 }
 
 pub fn run(ctx: &mut Context<'_>, args: &CandidatesArgs) -> Result<Report> {
