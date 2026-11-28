@@ -618,3 +618,216 @@ fn candidates_language_filter_uses_cached_profiles() {
         .collect();
     assert_eq!(numbers, [1]);
 }
+
+// --- claim-aware, filterable candidates ---
+
+fn numbers_of(report: &contrib_scout_core::discover::CandidatesReport) -> Vec<u64> {
+    let mut numbers: Vec<u64> = report
+        .candidates
+        .iter()
+        .map(|c| c.issue.issue.number)
+        .collect();
+    numbers.sort_unstable();
+    numbers
+}
+
+fn claim(h: &Harness, issue: &str, agent: &str, started_hours_ago: i64, lease_hours: i64) {
+    let start = Utc::now() - TimeDelta::hours(started_hours_ago);
+    h.store
+        .lock()
+        .unwrap()
+        .claim_issue(
+            &issue.parse().unwrap(),
+            &agent.parse().unwrap(),
+            start,
+            start + TimeDelta::hours(lease_hours),
+            None,
+        )
+        .unwrap();
+}
+
+#[test]
+fn candidates_hide_issues_actively_claimed_by_other_agents() {
+    let h = harness("claims", 50);
+    let gfi = &["good first issue"][..];
+    for number in 1..=3 {
+        insert_issue(&h.db, "a/one", number, "open", gfi, &[], 0, json!({}));
+    }
+    claim(&h, "a/one#1", "agent-b", 0, 48);
+    claim(&h, "a/one#2", "agent-a", 0, 48);
+    // Started 3h ago with a 1h lease: expired, hides nothing.
+    claim(&h, "a/one#3", "agent-b", 3, 1);
+
+    let as_agent = |agent: Option<&str>, include_claimed: bool| {
+        h.pipeline
+            .candidates(&CandidateQuery {
+                limit: 20,
+                agent: agent.map(|a| a.parse().unwrap()),
+                include_claimed,
+                ..CandidateQuery::default()
+            })
+            .unwrap()
+    };
+
+    let mine = as_agent(Some("agent-a"), false);
+    assert_eq!(numbers_of(&mine), [2, 3], "other agent's claim hidden");
+    assert_eq!(mine.excluded_claimed, 1);
+    let own = mine
+        .candidates
+        .iter()
+        .find(|c| c.issue.issue.number == 2)
+        .unwrap();
+    let own_claim = own.claim.as_ref().expect("own claim is reported");
+    assert_eq!(own_claim.agent.as_str(), "agent-a");
+    assert!(own_claim.lease_until > Utc::now());
+    let expired = mine
+        .candidates
+        .iter()
+        .find(|c| c.issue.issue.number == 3)
+        .unwrap();
+    assert_eq!(expired.claim, None, "an expired lease is not a claim");
+
+    let anonymous = as_agent(None, false);
+    assert_eq!(numbers_of(&anonymous), [3], "no agent id hides every claim");
+    assert_eq!(anonymous.excluded_claimed, 2);
+
+    let all = as_agent(None, true);
+    assert_eq!(numbers_of(&all), [1, 2, 3]);
+    assert_eq!(all.excluded_claimed, 0);
+    let other = all
+        .candidates
+        .iter()
+        .find(|c| c.issue.issue.number == 1)
+        .unwrap();
+    assert_eq!(other.claim.as_ref().unwrap().agent.as_str(), "agent-b");
+    let value = serde_json::to_value(&all).unwrap();
+    assert_eq!(value["excluded_claimed"], 0);
+    let listed = value["candidates"].as_array().unwrap();
+    let with_claim = listed
+        .iter()
+        .find(|c| c["issue"]["issue"] == "a/one#1")
+        .unwrap_or_else(|| panic!("{value}"));
+    assert_eq!(with_claim["claim"]["agent"], "agent-b");
+    assert!(
+        with_claim["claim"]["lease_until"].is_string(),
+        "{with_claim}"
+    );
+    let without = listed
+        .iter()
+        .find(|c| c["issue"]["issue"] == "a/one#3")
+        .unwrap();
+    assert!(without.get("claim").is_none(), "{without}");
+
+    // Released claims stop hiding the issue.
+    let released = h
+        .store
+        .lock()
+        .unwrap()
+        .release_claim(
+            &"a/one#1".parse().unwrap(),
+            &"agent-b".parse().unwrap(),
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(released);
+    let after = as_agent(Some("agent-a"), false);
+    assert_eq!(numbers_of(&after), [1, 2, 3]);
+    assert_eq!(after.excluded_claimed, 0);
+    assert_eq!(
+        h.fixture.request_count(),
+        0,
+        "candidates makes zero requests"
+    );
+}
+
+#[test]
+fn candidates_lease_expiry_makes_the_issue_visible_again() {
+    let h = harness("claims-expiry", 50);
+    insert_issue(
+        &h.db,
+        "a/one",
+        1,
+        "open",
+        &["good first issue"],
+        &[],
+        0,
+        json!({}),
+    );
+    // A lease that ends in the past is expired, even before any write marks it so.
+    claim(&h, "a/one#1", "agent-b", 2, 1);
+    let report = h
+        .pipeline
+        .candidates(&CandidateQuery {
+            limit: 20,
+            ..CandidateQuery::default()
+        })
+        .unwrap();
+    assert_eq!(numbers_of(&report), [1]);
+    assert_eq!(report.excluded_claimed, 0);
+    assert_eq!(report.candidates[0].claim, None);
+}
+
+#[test]
+fn candidates_filter_by_repo_and_labels() {
+    let h = harness("filters", 50);
+    insert_issue(
+        &h.db,
+        "a/one",
+        1,
+        "open",
+        &["Good First Issue", "help wanted"],
+        &[],
+        0,
+        json!({}),
+    );
+    insert_issue(
+        &h.db,
+        "a/one",
+        2,
+        "open",
+        &["good first issue"],
+        &[],
+        0,
+        json!({}),
+    );
+    insert_issue(
+        &h.db,
+        "B/Two",
+        3,
+        "open",
+        &["good first issue", "Help Wanted"],
+        &[],
+        0,
+        json!({}),
+    );
+    insert_issue(&h.db, "c/three", 4, "open", &["bug"], &[], 0, json!({}));
+    claim(&h, "c/three#4", "agent-b", 0, 48);
+
+    let run = |repos: &[&str], labels: &[&str]| {
+        h.pipeline
+            .candidates(&CandidateQuery {
+                limit: 20,
+                repos: repos.iter().map(|r| r.parse().unwrap()).collect(),
+                labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+                ..CandidateQuery::default()
+            })
+            .unwrap()
+    };
+
+    // Repository match is case-insensitive, for one repo and for several.
+    assert_eq!(numbers_of(&run(&["b/two"], &[])), [3]);
+    assert_eq!(numbers_of(&run(&["a/one", "B/TWO"], &[])), [1, 2, 3]);
+    // A claimed issue outside the filter is not counted.
+    assert_eq!(run(&["a/one"], &[]).excluded_claimed, 0);
+    assert_eq!(run(&[], &[]).excluded_claimed, 1);
+
+    // Labels: case-insensitive, and several labels must all be present.
+    assert_eq!(numbers_of(&run(&[], &["GOOD FIRST ISSUE"])), [1, 2, 3]);
+    assert_eq!(
+        numbers_of(&run(&[], &["good first issue", "HELP WANTED"])),
+        [1, 3]
+    );
+    assert_eq!(numbers_of(&run(&["a/one"], &["help wanted"])), [1]);
+    assert_eq!(numbers_of(&run(&[], &["nope"])), Vec::<u64>::new());
+    assert_eq!(h.fixture.request_count(), 0);
+}

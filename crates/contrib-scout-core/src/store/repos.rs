@@ -266,13 +266,14 @@ impl Store {
     }
 
     /// Open, unassigned issues from the local index (zero requests), newest
-    /// update first. `repos` empty means every indexed repository.
+    /// update first. `repos` empty means every indexed repository; repository
+    /// names match case-insensitively, as [`RepoName::key`] does.
     pub fn open_unassigned_issues(&self, repos: &[RepoName]) -> Result<Vec<IndexedIssue>> {
         let mut statement = self.conn.prepare(
             "SELECT repo, number, title, state, labels_json, assignees_json, comments,
                     created_at, updated_at, fetched_at, raw_json
              FROM issues
-             WHERE state = 'open' AND (?1 IS NULL OR repo = ?1)
+             WHERE state = 'open' AND (?1 IS NULL OR repo = ?1 COLLATE NOCASE)
              ORDER BY updated_at DESC, repo, number",
         )?;
         let single = match repos {
