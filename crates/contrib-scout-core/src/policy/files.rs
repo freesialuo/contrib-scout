@@ -10,10 +10,12 @@
 //!    empty repository) means the source has no files.
 //! 2. Only for sources whose HEAD moved (or that were never listed): one
 //!    GraphQL query for all of them together, listing the root, `.github/`
-//!    and `docs/` trees at that commit and returning the text of every
-//!    exact-case candidate path in the same response.
-//! 3. Only when a match differs in case from [`CANDIDATE_PATHS`] (or a text is
-//!    missing from the cache): one more GraphQL query fetching those blobs.
+//!    and `docs/` trees (and their `PULL_REQUEST_TEMPLATE/` directories) at
+//!    that commit and returning the text of every exact-case candidate path
+//!    in the same response.
+//! 3. Only when a match differs from [`CANDIDATE_PATHS`] (another case or
+//!    extension, a template-directory file) or a text is missing from the
+//!    cache: one more GraphQL query fetching those blobs. Never offline.
 //!
 //! Cold: 2 REST + 1 (rarely 2) GraphQL requests. Warm within `policy_files_ttl`
 //! (`Default`): zero requests. Warm after the TTL: one 304 per source.
@@ -45,11 +47,15 @@ use std::sync::{Arc, MutexGuard};
 
 /// Where AI policies are found (§2). Checked in both `{owner}/.github` and the
 /// repository. Matched case-insensitively against listings of the root,
-/// `.github/`, and `docs/`.
+/// `.github/`, and `docs/`; see [`CANDIDATE_STEMS`] and [`TEMPLATE_DIRS`]
+/// for the other spellings a candidate stands for.
 pub const CANDIDATE_PATHS: &[&str] = &[
     "AI_POLICY.md",
     "LLM_POLICY.md",
     ".github/AI_POLICY.md",
+    ".github/LLM_POLICY.md",
+    "docs/AI_POLICY.md",
+    "docs/LLM_POLICY.md",
     "CONTRIBUTING.md",
     ".github/CONTRIBUTING.md",
     "docs/CONTRIBUTING.md",
@@ -65,6 +71,25 @@ pub const CANDIDATE_PATHS: &[&str] = &[
 
 /// Directories listed to find candidates: root, `.github`, `docs`.
 pub const PROBE_DIRS: &[&str] = &["", ".github", "docs"];
+
+/// File-name stems (the name up to its first `.`, any case, `-` read as `_`)
+/// matched in every [`PROBE_DIRS`] entry with any extension or none:
+/// `CONTRIBUTING.rst`, `docs/ai_policy.txt`, `.github/CONTRIBUTING`. Each
+/// stem has a [`CANDIDATE_PATHS`] entry in every probed directory.
+pub const CANDIDATE_STEMS: &[&str] = &["ai_policy", "llm_policy", "contributing"];
+
+/// Spellings of the multi-template directory listed in every [`PROBE_DIRS`]
+/// entry (`.github/PULL_REQUEST_TEMPLATE/*.md`); each file in it stands for
+/// that directory's single-file PR template candidate. Git paths are
+/// case-sensitive, so each spelling is its own lookup in the listing query.
+pub const TEMPLATE_DIRS: &[&str] = &["PULL_REQUEST_TEMPLATE", "pull_request_template"];
+
+/// Git file mode of a symbolic link: the blob's text is the link target.
+const SYMLINK_MODE: u64 = 0o120000;
+
+/// Kept in a found row's `etag` (unused for files: blobs are addressed by
+/// oid) so the symlink flag survives the cache.
+const SYMLINK_TAG: &str = "git-mode:120000";
 
 /// Media type that makes `commits/{ref}` return the bare SHA.
 pub const SHA_MEDIA_TYPE: &str = "application/vnd.github.sha";
@@ -122,11 +147,69 @@ pub fn unique_candidates() -> impl Iterator<Item = &'static str> {
     })
 }
 
-/// Index of the candidate `path` matches (case-insensitively).
+/// `(directory, file name)` of a repository path.
+fn split_path(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
+}
+
+/// The [`CANDIDATE_STEMS`] form of a file name.
+fn file_stem(name: &str) -> String {
+    name.split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+}
+
+/// Index of the candidate `path` stands for: the same path in any case; a
+/// file with one of the [`CANDIDATE_STEMS`] in a probed directory; or a file
+/// in a [`TEMPLATE_DIRS`] directory, standing for that directory's
+/// single-file template.
 fn candidate_rank(path: &str) -> Option<usize> {
-    CANDIDATE_PATHS
+    let exact = CANDIDATE_PATHS
         .iter()
-        .position(|candidate| candidate.eq_ignore_ascii_case(path))
+        .position(|candidate| candidate.eq_ignore_ascii_case(path));
+    if exact.is_some() {
+        return exact;
+    }
+    let (dir, name) = split_path(path);
+    let (parent, sub) = split_path(dir);
+    let (dir, stem) = if !dir.is_empty() && TEMPLATE_DIRS[0].eq_ignore_ascii_case(sub) {
+        (parent, TEMPLATE_DIRS[1].to_owned())
+    } else {
+        let stem = file_stem(name);
+        if !CANDIDATE_STEMS.contains(&stem.as_str()) {
+            return None;
+        }
+        (dir, stem)
+    };
+    if !PROBE_DIRS.contains(&dir) {
+        return None;
+    }
+    CANDIDATE_PATHS.iter().position(|candidate| {
+        let (candidate_dir, candidate_name) = split_path(candidate);
+        candidate_dir == dir && file_stem(candidate_name) == stem
+    })
+}
+
+/// `dir/name`, or `name` at the root.
+fn join_path(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// `repo/path` of every found file whose text is not in `states`.
+fn missing_text(states: &[SourceState]) -> Vec<String> {
+    states
+        .iter()
+        .flat_map(|state| state.rows.iter().flatten())
+        .filter_map(|row| row.file.as_ref())
+        .filter(|file| file.text.is_none())
+        .map(|file| format!("{}/{}", file.repo, file.path))
+        .collect()
 }
 
 /// How one source repository was checked.
@@ -161,7 +244,8 @@ pub struct PolicyFetch {
     /// [`CANDIDATE_PATHS`] order.
     pub files: Vec<PolicyFile>,
     pub absent: Vec<AbsentPath>,
-    /// Stale-cache notes for `meta.warnings` (sets `meta.partial`).
+    /// Stale-cache, missing-text and symlink notes for `meta.warnings`
+    /// (sets `meta.partial`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -208,6 +292,8 @@ fn lock(store: &SharedStore) -> MutexGuard<'_, Store> {
 
 /// Found blob in a listing.
 struct Match {
+    /// Git mode 120000: the blob's text is the link target.
+    symlink: bool,
     path: String,
     oid: String,
     size: u64,
@@ -248,10 +334,14 @@ impl GitHubPolicyFiles {
                 Err(error) if matches!(read, Read::Cached(_)) => {
                     // Serve the previous snapshot rather than nothing.
                     let mut served = false;
+                    let mut unserved = Vec::new();
                     for &i in &to_list {
-                        if !states[i].previous.is_empty() {
+                        // Either way nothing is cached for the new commit.
+                        states[i].dirty = false;
+                        if states[i].previous.is_empty() {
+                            unserved.push(states[i].repo.to_string());
+                        } else {
                             states[i].rows = Some(std::mem::take(&mut states[i].previous));
-                            states[i].dirty = false;
                             served = true;
                         }
                     }
@@ -261,13 +351,39 @@ impl GitHubPolicyFiles {
                     warnings.push(format!(
                         "listing policy files failed ({error:#}); served the previously cached files"
                     ));
+                    if !unserved.is_empty() {
+                        warnings.push(format!(
+                            "{} had no previously cached policy files; none are listed for it",
+                            unserved.join(", ")
+                        ));
+                    }
                 }
                 Err(error) => return Err(error),
             }
         }
 
         if want_text {
-            self.fill_missing_text(&mut states)?;
+            match read {
+                // Cache-only: report the missing text instead of fetching it.
+                Read::Cached(Freshness::Offline) => {
+                    let missing = missing_text(&states);
+                    if !missing.is_empty() {
+                        warnings.push(format!(
+                            "policy file text is not cached for {}; run without --offline to fetch it",
+                            missing.join(", ")
+                        ));
+                    }
+                }
+                Read::Cached(_) => {
+                    if let Err(error) = self.fill_missing_text(&mut states) {
+                        warnings.push(format!(
+                            "fetching policy file text failed ({error:#}); served {} without text",
+                            missing_text(&states).join(", ")
+                        ));
+                    }
+                }
+                Read::Live(_) => self.fill_missing_text(&mut states)?,
+            }
         }
 
         {
@@ -322,6 +438,17 @@ impl GitHubPolicyFiles {
                     Some(file) => {
                         let mut file = file.clone();
                         file.fetched_at = state.checked_at;
+                        if row.etag.as_deref() == Some(SYMLINK_TAG) {
+                            let target = file
+                                .text
+                                .as_deref()
+                                .map(|t| format!(" to `{}`", t.trim()))
+                                .unwrap_or_default();
+                            warnings.push(format!(
+                                "{}/{} is a symbolic link{target}; its text is the link target, not a policy: read the target file",
+                                file.repo, file.path
+                            ));
+                        }
                         if !want_text {
                             file.text = None;
                         }
@@ -368,12 +495,10 @@ impl GitHubPolicyFiles {
         let marker = marker.filter(|m| m.data.status != 200 || !cached_rows.is_empty());
 
         if let Read::Cached(mode) = read {
-            let young = marker.as_ref().is_some_and(|m| {
-                (now - m.fetched_at)
-                    .to_std()
-                    .map(|age| age < ttl)
-                    .unwrap_or(true)
-            });
+            // A marker dated in the future (clock skew) is stale, not young.
+            let young = marker
+                .as_ref()
+                .is_some_and(|m| (now - m.fetched_at).to_std().is_ok_and(|age| age < ttl));
             if mode == Freshness::Offline || (mode == Freshness::Default && young) {
                 let Some(marker) = marker else {
                     return Err(ScoutError::NotFound {
@@ -484,6 +609,16 @@ impl GitHubPolicyFiles {
                 body.push_str(&format!(
                     "    d{k}: object(expression: $d{slot}_{k}) {{ ...tree }}\n"
                 ));
+                for (c, name) in TEMPLATE_DIRS.iter().enumerate() {
+                    decls.push(format!("$t{slot}_{k}_{c}: String!"));
+                    vars.insert(
+                        format!("t{slot}_{k}_{c}"),
+                        json!(format!("{commit}:{}", join_path(dir, name))),
+                    );
+                    body.push_str(&format!(
+                        "    t{k}_{c}: object(expression: $t{slot}_{k}_{c}) {{ ...tree }}\n"
+                    ));
+                }
             }
             if want_text {
                 for (j, path) in CANDIDATE_PATHS.iter().enumerate() {
@@ -511,12 +646,23 @@ impl GitHubPolicyFiles {
                 .get(format!("s{slot}"))
                 .filter(|v| !v.is_null())
                 .ok_or_else(|| anyhow!("GraphQL returned no repository {}", state.repo))?;
-            let mut matches = Vec::new();
-            for (k, dir) in PROBE_DIRS.iter().enumerate() {
-                let entries = repo_data
-                    .get(format!("d{k}"))
+            // Every listed tree with its path: each probed directory, then
+            // its template directories.
+            let entries_of = |alias: String| {
+                repo_data
+                    .get(alias)
                     .and_then(|tree| tree.get("entries"))
-                    .and_then(Value::as_array);
+                    .and_then(Value::as_array)
+            };
+            let mut listed = Vec::new();
+            for (k, dir) in PROBE_DIRS.iter().enumerate() {
+                listed.push((dir.to_string(), entries_of(format!("d{k}"))));
+                for (c, name) in TEMPLATE_DIRS.iter().enumerate() {
+                    listed.push((join_path(dir, name), entries_of(format!("t{k}_{c}"))));
+                }
+            }
+            let mut matches = Vec::new();
+            for (dir, entries) in listed {
                 for entry in entries.into_iter().flatten() {
                     if entry.get("type").and_then(Value::as_str) != Some("blob") {
                         continue;
@@ -524,15 +670,12 @@ impl GitHubPolicyFiles {
                     let Some(name) = entry.get("name").and_then(Value::as_str) else {
                         continue;
                     };
-                    let path = if dir.is_empty() {
-                        name.to_owned()
-                    } else {
-                        format!("{dir}/{name}")
-                    };
+                    let path = join_path(&dir, name);
                     if candidate_rank(&path).is_none() {
                         continue;
                     }
                     matches.push(Match {
+                        symlink: entry.get("mode").and_then(Value::as_u64) == Some(SYMLINK_MODE),
                         path,
                         oid: entry
                             .get("oid")
@@ -581,13 +724,18 @@ impl GitHubPolicyFiles {
                     }),
                     commit: None,
                     url: Some(url),
-                    etag: None,
+                    etag: found.symlink.then(|| SYMLINK_TAG.to_owned()),
                     fetched_at: state.checked_at,
                 });
             }
-            // Absent candidates, one row per case-insensitive path.
+            // Absent candidates, one row per case-insensitive path, unless a
+            // found file stands for it (another extension, a template directory).
             for path in unique_candidates() {
-                if matches.iter().any(|m| m.path.eq_ignore_ascii_case(path)) {
+                let covered = matches.iter().any(|m| {
+                    candidate_rank(&m.path)
+                        .is_some_and(|rank| CANDIDATE_PATHS[rank].eq_ignore_ascii_case(path))
+                });
+                if covered {
                     continue;
                 }
                 rows.push(CachedPolicyFile {
@@ -683,7 +831,7 @@ impl GitHubPolicyFiles {
 }
 
 const TREE_FRAGMENT: &str =
-    "fragment tree on Tree { entries { name type oid object { ... on Blob { byteSize } } } }\n";
+    "fragment tree on Tree { entries { name type mode oid object { ... on Blob { byteSize } } } }\n";
 const BLOB_FRAGMENT: &str = "fragment blob on Blob { oid byteSize isTruncated text }\n";
 
 /// `(text, truncated, size)` of a GraphQL `Blob`. Binary blobs have no text.
