@@ -10,7 +10,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR runs are cancelled; a main run that has started is never cancelled.
+  # GitHub still keeps one pending run per group, so a queued main run can be replaced by a newer one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   quality:
@@ -32,6 +34,10 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
       - run: cargo +stable fmt --all --check
       - run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+      - name: Check rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +stable doc --locked --workspace --no-deps
 
   msrv:
     name: Minimum supported Rust version
