@@ -285,18 +285,27 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the mark and appends an `unset` history row holding the removed
-    /// mark. Returns the removed mark, if any.
+    /// Deletes the mark and, if one existed, appends an `unset` history row
+    /// holding it. Returns the removed mark.
     pub fn delete_mark(
         &mut self,
         target: &MarkTarget,
         agent: &AgentId,
         at: DateTime<Utc>,
     ) -> Result<Option<PolicyMark>> {
-        let existing = self.mark(target)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Read under the write lock, so the history row holds what is deleted.
+        let sql = format!("SELECT {MARK_COLUMNS} FROM policy_marks WHERE target = ?1");
+        let existing = tx
+            .query_row(&sql, params![target.key()], mark_from_row)
+            .optional()?
+            .map(MarkRow::into_mark)
+            .transpose()?;
+        if existing.is_none() {
+            return Ok(None);
+        }
         tx.execute(
             "DELETE FROM policy_marks WHERE target = ?1",
             params![target.key()],

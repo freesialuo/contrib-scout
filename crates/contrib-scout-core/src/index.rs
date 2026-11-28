@@ -18,16 +18,27 @@
 //!   `updated_at`). A page-1 answer is always a consistent prefix of the
 //!   remaining items. Only when a page makes no progress (no item newer than
 //!   the `since` it was asked with, e.g. more than a page of items share one
-//!   timestamp) is its `Link: rel="next"` page followed instead; such a pass
-//!   can skip items again, so its watermark never advances past the one the
-//!   pass started from (on a first pass: the `since` of that request).
+//!   timestamp) is its `Link: rel="next"` page followed instead. Page numbers
+//!   only skip an item when the listing shifts while the pass pages through
+//!   it, and every skipped item is at or after that `since`. With `state=all`
+//!   a shift comes from an update, and the updated item comes back at the end
+//!   of the listing, which a completed pass reads: so a completed pass that
+//!   saw no stored item come back with a newer `updated_at` skipped nothing
+//!   and advances normally (pinning it instead would make every later pass
+//!   re-list the same cluster, forever). A pass that stopped early, saw an
+//!   item move, or lists `state=open` (a closed issue leaves without coming
+//!   back) keeps its watermark at the one the pass started from (on a first
+//!   pass: the `since` of that request), so the next pass reads the cluster
+//!   again. A deletion or transfer mid-pass also shifts the listing and
+//!   cannot be seen; that window is the seconds spent paging a cluster.
 //! - Because every keyset page is a prefix in ascending `updated_at` order,
 //!   after any page every item updated before the largest `updated_at` seen so
 //!   far is stored. An interrupted pass therefore checkpoints `since = max
 //!   updated_at seen` (never moving backwards) and is marked `partial`; the
 //!   next run resumes from there and ignores the TTL.
 //! - A completed pass sets the watermark to the time its earliest run
-//!   *started* (local clock), unless it had to follow `Link` pages (above). Anything updated while the pass was running, or
+//!   *started* (local clock), unless it keeps a pin from `Link` pages (above).
+//!   Anything updated while the pass was running, or
 //!   while it was interrupted, is newer than that and is listed again by the
 //!   next pass; `index_overlap` (default 10m) absorbs clock skew between this
 //!   machine and GitHub. Using the start time rather than the newest
@@ -35,7 +46,8 @@
 //! - `Default` sends nothing when the last complete pass started within
 //!   `issue_index_ttl`; `Fresh` ignores the TTL; `Offline` never sends.
 //! - One process syncs a repository at a time (`Store::lock_scope`); a second
-//!   one waits up to `lock_wait` and then re-checks the TTL.
+//!   one waits up to `lock_wait` and then re-checks the TTL. It polls the lock
+//!   without holding the store mutex, so its other threads keep the database.
 //! - List pages are sent uncached (`Gateway::send`): their `since` changes on
 //!   every pass, so conditional caching would only grow `http_cache`.
 //!
@@ -54,7 +66,7 @@ use crate::gateway::Gateway;
 use crate::models::{
     IssueComment, IssueDetail, IssueRef, IssueRow, IssueState, LinkedPr, RepoName,
 };
-use crate::store::{SharedStore, Store, SyncState};
+use crate::store::{ScopeLock, SharedStore, Store, SyncState};
 use crate::transport::{ApiRequest, ApiResponse};
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
@@ -62,7 +74,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Why a sync sent no requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +410,20 @@ impl GitHubIndexer {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// [`Store::lock_scope`], polled so the store mutex is only held for each
+    /// attempt, not while another process keeps the lock.
+    fn lock_scope(&self, scope: &str, max_wait: Duration) -> Result<Option<ScopeLock>> {
+        let start = Instant::now();
+        loop {
+            let lock = self.store().lock_scope(scope, Duration::ZERO)?;
+            let elapsed = start.elapsed();
+            if lock.is_some() || elapsed >= max_wait {
+                return Ok(lock);
+            }
+            thread::sleep(Duration::from_millis(25).min(max_wait - elapsed));
+        }
+    }
+
     fn within_ttl(state: &SyncState, now: DateTime<Utc>, ttl: Duration) -> bool {
         !state.partial
             && state
@@ -422,7 +449,7 @@ impl GitHubIndexer {
         // One syncer per repository across processes. The guard owns a file
         // handle, not the store mutex, so the gateway can still use the store.
         let scope = format!("sync {}", repo.key());
-        let guard = self.store().lock_scope(&scope, self.config.lock_wait())?;
+        let guard = self.lock_scope(&scope, self.config.lock_wait())?;
         let Some(_guard) = guard else {
             report.skipped = Some(SyncSkip::Locked);
             report
@@ -463,8 +490,12 @@ impl GitHubIndexer {
         let mut watermark = state.since;
         // Set once a page made no progress and its `Link` page was followed:
         // page numbers can skip items, so the watermark stays at the pass's
-        // starting one (or the `since` of that request when there was none).
+        // starting one (or the `since` of that request when there was none)
+        // unless the pass completes without seeing an item move.
         let mut capped: Option<Option<DateTime<Utc>>> = None;
+        // An item stored by this pass came back with a newer `updated_at`:
+        // the listing shifted, so `Link` pages may have skipped an item.
+        let mut moved = false;
         let mut cursor = since;
         // Issue number -> `updated_at` already stored by this pass.
         let mut seen: BTreeMap<u64, DateTime<Utc>> = BTreeMap::new();
@@ -516,8 +547,10 @@ impl GitHubIndexer {
                 }
                 // `since` is inclusive: skip what this pass already stored.
                 if let (Some(number), Some(updated)) = (item["number"].as_u64(), updated) {
-                    if seen.insert(number, updated) == Some(updated) {
-                        continue;
+                    match seen.insert(number, updated) {
+                        Some(before) if before == updated => continue,
+                        Some(_) => moved = true,
+                        None => {}
                     }
                 }
                 if item.get("pull_request").is_some() {
@@ -570,7 +603,11 @@ impl GitHubIndexer {
 
         let final_state = if complete {
             SyncState {
-                since: capped.unwrap_or(Some(pass_started)),
+                // Complete, so every shift by an update was seen (module docs).
+                since: match capped {
+                    Some(pin) if first_pass || moved => pin,
+                    _ => Some(pass_started),
+                },
                 last_full_at: if first_pass {
                     Some(started)
                 } else {

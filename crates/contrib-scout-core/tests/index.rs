@@ -390,13 +390,132 @@ fn mid_pass_update_cannot_skip_an_item() {
     assert!(state.since.unwrap() >= before - TimeDelta::seconds(1));
 }
 
+const CLUSTER_PAGE2: &str =
+    "https://api.github.com/repositories/1/issues?state=all&since=2026-11-20T09:50:00Z&page=2";
+
+/// Page 1 of `since=09:50` holds only items at 09:50 itself (no keyset
+/// progress), so the pass follows `Link` to [`CLUSTER_PAGE2`].
+fn script_cluster(h: &Harness, cluster: [u64; 2], page2: Vec<Value>) {
+    h.fixture.expect_get(
+        format!("{ALL_SINCE}2026-11-20T09:50:00Z"),
+        page(
+            cluster
+                .iter()
+                .map(|&n| issue(n, at(9, 50), "open", 0))
+                .collect(),
+            Some(CLUSTER_PAGE2),
+        ),
+    );
+    h.fixture.expect_get(CLUSTER_PAGE2, page(page2, None));
+}
+
 #[test]
-fn a_full_page_at_one_timestamp_follows_link_and_keeps_the_watermark() {
+fn a_full_page_at_one_timestamp_follows_link_and_advances_when_nothing_moved() {
     let h = harness(10);
     seed_incremental(&h);
-    let page2 =
-        "https://api.github.com/repositories/1/issues?state=all&since=2026-11-20T09:50:00Z&page=2";
-    // Every item is at the `since` time itself: no progress by keyset.
+    script_cluster(&h, [5, 6], vec![issue(7, at(10, 30), "open", 0)]);
+    let before = Utc::now();
+    let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert!(!report.partial);
+    assert_eq!(report.new_issues, 3);
+    // Page numbers only skip an item when the listing shifts mid-pass. An
+    // update shifts it and the updated item comes back at the end; nothing
+    // came back, so the pass covered everything and the watermark advances
+    // (pinning it would re-list the cluster on every later pass, forever).
+    let state = h.store.lock().unwrap().sync_state(&repo()).unwrap();
+    assert!(!state.partial);
+    assert!(state.since.unwrap() >= before - TimeDelta::seconds(1));
+    assert!(report.watermark.unwrap() >= before);
+}
+
+#[test]
+fn a_capped_pass_that_saw_an_item_move_keeps_the_watermark_and_the_next_pass_advances() {
+    let h = harness(10);
+    seed_incremental(&h);
+    // Issue 5 is updated while the pass pages by number: it comes back at
+    // the end, and the item that slid onto page 1 may have been skipped.
+    script_cluster(
+        &h,
+        [5, 6],
+        vec![
+            issue(7, at(10, 30), "open", 0),
+            issue(5, at(10, 45), "closed", 1),
+        ],
+    );
+    let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert!(!report.partial);
+    assert_eq!(report.watermark, Some(at(10, 0)), "pinned");
+    let state = h.store.lock().unwrap().sync_state(&repo()).unwrap();
+    assert!(!state.partial);
+    assert_eq!(state.since, Some(at(10, 0)));
+
+    // The next pass re-reads the cluster (here issue 8 had slid onto page 1)
+    // and, with nothing moving this time, advances.
+    script_cluster(
+        &h,
+        [6, 8],
+        vec![
+            issue(7, at(10, 30), "open", 0),
+            issue(5, at(10, 45), "closed", 1),
+        ],
+    );
+    let before = Utc::now();
+    let report = h.indexer.sync(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    assert!(!report.partial);
+    assert_eq!(report.since, Some(at(9, 50)));
+    assert_eq!(report.new_issues, 1, "issue 8");
+    let state = h.store.lock().unwrap().sync_state(&repo()).unwrap();
+    assert!(state.since.unwrap() >= before - TimeDelta::seconds(1));
+    assert!(h
+        .store
+        .lock()
+        .unwrap()
+        .issue(&issue_ref(8))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn a_capped_first_pass_pins_to_the_cluster_and_the_next_pass_advances() {
+    let h = harness(10);
+    let page2 = "https://api.github.com/repositories/1/issues?state=open&page=2";
+    let cluster = || vec![issue(1, at(1, 0), "open", 0), issue(2, at(1, 0), "open", 0)];
+    h.fixture.expect_get(FIRST, page(cluster(), Some(page2)));
+    h.fixture.expect_get(
+        format!("{FIRST}&since=2026-11-20T01:00:00Z"),
+        page(cluster(), Some(page2)),
+    );
+    h.fixture
+        .expect_get(page2, page(vec![issue(3, at(2, 0), "open", 0)], None));
+    let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert!(report.first_pass && !report.partial);
+    // `state=open`: an issue closed mid-pass leaves the listing without
+    // coming back, so a capped first pass always pins to the cluster time.
+    assert_eq!(report.watermark, Some(at(1, 0)));
+
+    let all = |since: &str| format!("{ALL_SINCE}{since}");
+    let page2 = "https://api.github.com/repositories/1/issues?state=all&page=2";
+    h.fixture
+        .expect_get(all("2026-11-20T00:50:00Z"), page(cluster(), Some(page2)));
+    h.fixture
+        .expect_get(all("2026-11-20T01:00:00Z"), page(cluster(), Some(page2)));
+    h.fixture
+        .expect_get(page2, page(vec![issue(3, at(2, 0), "open", 0)], None));
+    let before = Utc::now();
+    let report = h.indexer.sync(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    assert!(!report.first_pass && !report.partial);
+    assert!(report.watermark.unwrap() >= before - TimeDelta::seconds(1));
+}
+
+#[test]
+fn a_capped_pass_stopped_early_keeps_the_pin() {
+    let h = harness(1);
+    seed_incremental(&h);
     h.fixture.expect_get(
         format!("{ALL_SINCE}2026-11-20T09:50:00Z"),
         page(
@@ -404,21 +523,80 @@ fn a_full_page_at_one_timestamp_follows_link_and_keeps_the_watermark() {
                 issue(5, at(9, 50), "open", 0),
                 issue(6, at(9, 50), "open", 0),
             ],
-            Some(page2),
+            Some(CLUSTER_PAGE2),
         ),
     );
-    h.fixture
-        .expect_get(page2, page(vec![issue(7, at(10, 30), "open", 0)], None));
     let report = h.indexer.sync(&repo(), Freshness::Default).unwrap();
     h.fixture.assert_drained();
-    assert!(!report.partial);
-    assert_eq!(report.new_issues, 3);
-    // Page numbers can skip items, so the watermark does not move past the
-    // one this pass started from.
+    assert!(report.partial);
     let state = h.store.lock().unwrap().sync_state(&repo()).unwrap();
-    assert!(!state.partial);
+    assert!(state.partial);
     assert_eq!(state.since, Some(at(10, 0)));
-    assert_eq!(report.watermark, Some(at(10, 0)));
+}
+
+fn temp_db(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ))
+        .join("scout.db")
+}
+
+#[test]
+fn waiting_for_another_syncer_does_not_hold_the_store_mutex() {
+    let db = temp_db("sync-lock");
+    let store = Store::open(&db).unwrap().shared();
+    let h = harness_on(
+        store.clone(),
+        10,
+        Config {
+            lock_wait: "1s".into(),
+            ..Config::default()
+        },
+    );
+    // Another process holds the repository's sync lock.
+    let other = Store::open(&db).unwrap();
+    let held = other
+        .lock_scope("sync o/r", std::time::Duration::ZERO)
+        .unwrap();
+    assert!(held.is_some());
+
+    std::thread::scope(|scope| {
+        let syncing = scope.spawn(|| h.indexer.sync(&repo(), Freshness::Default).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // While the sync waits, this process can still use the store.
+        let free = (0..30).any(|_| {
+            let free = store.try_lock().is_ok();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            free
+        });
+        assert!(free, "the store mutex was held while waiting for the lock");
+        let report = syncing.join().unwrap();
+        assert_eq!(report.skipped, Some(SyncSkip::Locked));
+    });
+    assert_eq!(h.fixture.request_count(), 0);
+    drop(held);
+}
+
+#[test]
+fn stored_index_json_drops_the_body() {
+    let db = temp_db("index-body");
+    let h = harness_on(Store::open(&db).unwrap().shared(), 10, Config::default());
+    h.fixture
+        .expect_get(FIRST, page(vec![issue(1, at(1, 0), "open", 0)], None));
+    h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let raw: String = conn
+        .query_row("SELECT raw_json FROM issues WHERE number = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let raw: Value = serde_json::from_str(&raw).unwrap();
+    assert!(raw.get("body").is_none(), "{raw}");
+    assert_eq!(raw["number"], 1);
+    assert_eq!(raw["title"], "Issue 1");
 }
 
 // ---------------------------------------------------------------------------
