@@ -18,16 +18,27 @@
 //!   `updated_at`). A page-1 answer is always a consistent prefix of the
 //!   remaining items. Only when a page makes no progress (no item newer than
 //!   the `since` it was asked with, e.g. more than a page of items share one
-//!   timestamp) is its `Link: rel="next"` page followed instead; such a pass
-//!   can skip items again, so its watermark never advances past the one the
-//!   pass started from (on a first pass: the `since` of that request).
+//!   timestamp) is its `Link: rel="next"` page followed instead. Page numbers
+//!   only skip an item when the listing shifts while the pass pages through
+//!   it, and every skipped item is at or after that `since`. With `state=all`
+//!   a shift comes from an update, and the updated item comes back at the end
+//!   of the listing, which a completed pass reads: so a completed pass that
+//!   saw no stored item come back with a newer `updated_at` skipped nothing
+//!   and advances normally (pinning it instead would make every later pass
+//!   re-list the same cluster, forever). A pass that stopped early, saw an
+//!   item move, or lists `state=open` (a closed issue leaves without coming
+//!   back) keeps its watermark at the one the pass started from (on a first
+//!   pass: the `since` of that request), so the next pass reads the cluster
+//!   again. A deletion or transfer mid-pass also shifts the listing and
+//!   cannot be seen; that window is the seconds spent paging a cluster.
 //! - Because every keyset page is a prefix in ascending `updated_at` order,
 //!   after any page every item updated before the largest `updated_at` seen so
 //!   far is stored. An interrupted pass therefore checkpoints `since = max
 //!   updated_at seen` (never moving backwards) and is marked `partial`; the
 //!   next run resumes from there and ignores the TTL.
 //! - A completed pass sets the watermark to the time its earliest run
-//!   *started* (local clock), unless it had to follow `Link` pages (above). Anything updated while the pass was running, or
+//!   *started* (local clock), unless it keeps a pin from `Link` pages (above).
+//!   Anything updated while the pass was running, or
 //!   while it was interrupted, is newer than that and is listed again by the
 //!   next pass; `index_overlap` (default 10m) absorbs clock skew between this
 //!   machine and GitHub. Using the start time rather than the newest
@@ -463,8 +474,12 @@ impl GitHubIndexer {
         let mut watermark = state.since;
         // Set once a page made no progress and its `Link` page was followed:
         // page numbers can skip items, so the watermark stays at the pass's
-        // starting one (or the `since` of that request when there was none).
+        // starting one (or the `since` of that request when there was none)
+        // unless the pass completes without seeing an item move.
         let mut capped: Option<Option<DateTime<Utc>>> = None;
+        // An item stored by this pass came back with a newer `updated_at`:
+        // the listing shifted, so `Link` pages may have skipped an item.
+        let mut moved = false;
         let mut cursor = since;
         // Issue number -> `updated_at` already stored by this pass.
         let mut seen: BTreeMap<u64, DateTime<Utc>> = BTreeMap::new();
@@ -516,8 +531,10 @@ impl GitHubIndexer {
                 }
                 // `since` is inclusive: skip what this pass already stored.
                 if let (Some(number), Some(updated)) = (item["number"].as_u64(), updated) {
-                    if seen.insert(number, updated) == Some(updated) {
-                        continue;
+                    match seen.insert(number, updated) {
+                        Some(before) if before == updated => continue,
+                        Some(_) => moved = true,
+                        None => {}
                     }
                 }
                 if item.get("pull_request").is_some() {
@@ -570,7 +587,11 @@ impl GitHubIndexer {
 
         let final_state = if complete {
             SyncState {
-                since: capped.unwrap_or(Some(pass_started)),
+                // Complete, so every shift by an update was seen (module docs).
+                since: match capped {
+                    Some(pin) if first_pass || moved => pin,
+                    _ => Some(pass_started),
+                },
                 last_full_at: if first_pass {
                     Some(started)
                 } else {
