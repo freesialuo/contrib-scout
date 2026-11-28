@@ -96,6 +96,19 @@ fn put_get_delete_with_history() {
 }
 
 #[test]
+fn unmark_of_a_never_marked_issue_writes_no_history() {
+    let mut store = Store::memory().unwrap();
+    let reference = issue("o/r#8");
+    assert_eq!(
+        store
+            .delete_issue_mark(&reference, &agent(), at(1))
+            .unwrap(),
+        None
+    );
+    assert!(store.issue_mark_history(&reference).unwrap().is_empty());
+}
+
+#[test]
 fn validation_requires_reason_for_skip_only_and_a_note() {
     let mut store = Store::memory().unwrap();
     let reference = issue("o/r#1");
