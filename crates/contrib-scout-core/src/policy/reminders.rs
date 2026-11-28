@@ -81,7 +81,8 @@ pub fn human_line(reminder: &Reminder) -> String {
             if let Some(target) = reminder
                 .target
                 .as_ref()
-                .filter(|t| t.key() != reminder.repo.to_string())
+                // Mark lookup ignores case, so this comparison must too.
+                .filter(|t| !t.key().eq_ignore_ascii_case(&reminder.repo.to_string()))
             {
                 line.push_str(&format!(" [via {} {}]", target.kind(), target));
             }

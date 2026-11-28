@@ -174,6 +174,12 @@ fn reminders_come_from_the_store() {
     assert!(due.review_due);
     assert!(human_line(&due).contains("[review due]"));
 
+    // A repository spelled in another case is not "via" its own mark.
+    let shouty: RepoName = "Acme/Widget".parse().unwrap();
+    let line = human_line(&repo_reminder(&store, &shouty, at(2)).unwrap());
+    assert!(line.contains("Requires AI disclosure"), "{line}");
+    assert!(!line.contains("[via"), "{line}");
+
     let all = repo_reminders(&store, &[widget, gadget, solo], at(2)).unwrap();
     assert_eq!(
         all.iter().map(|r| r.kind.clone()).collect::<Vec<_>>(),
