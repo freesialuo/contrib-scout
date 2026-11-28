@@ -166,6 +166,33 @@ pub fn requirement_text(requirement: &Requirement) -> String {
     }
 }
 
+/// Mark values written by a newer version (`Unknown` stance, scope
+/// restriction, or requirement), as `key: value`. The gates cannot tell
+/// whether they restrict the work, so any of them blocks (fail closed).
+fn unknown_mark_values(mark: &PolicyMark) -> Vec<String> {
+    let mut unknown = Vec::new();
+    if let Stance::Unknown(stance) = &mark.stance {
+        unknown.push(format!("stance: {stance}"));
+    }
+    let scope = &mark.scope;
+    for (name, restriction) in [
+        ("code", &scope.code),
+        ("pr_text", &scope.pr_text),
+        ("comments", &scope.comments),
+        ("autonomous_agents", &scope.autonomous_agents),
+    ] {
+        if let Restriction::Unknown(value) = restriction {
+            unknown.push(format!("{name}: {value}"));
+        }
+    }
+    for requirement in &mark.requirements {
+        if let Requirement::Unknown(value) = requirement {
+            unknown.push(format!("requirement: {value}"));
+        }
+    }
+    unknown
+}
+
 fn is_pr_template(path: &str) -> bool {
     path.to_ascii_lowercase().contains("pull_request_template")
 }
@@ -390,6 +417,17 @@ pub fn evaluate(
                 block(
                     BlockReason::PolicyBans,
                     format!("{} is marked bans: \"{}\"", mark.target, mark.note),
+                );
+            }
+            let unknown = unknown_mark_values(mark);
+            if !unknown.is_empty() {
+                block(
+                    BlockReason::HumanRequired,
+                    format!(
+                        "the mark on {} has values this version of contrib-scout does not understand ({}); upgrade contrib-scout or re-mark with known values, otherwise stop and hand the work to a human",
+                        mark.target,
+                        unknown.join(", ")
+                    ),
                 );
             }
             if mark.review_due(now) {
@@ -642,7 +680,8 @@ pub fn parse_closing_prs(nodes: &[Value]) -> Vec<LinkedPr> {
 }
 
 /// Adds closing-reference PRs to the timeline's linked PRs: new URLs are
-/// appended, known ones get missing author / state / head branch filled in.
+/// appended, known ones get missing author / state / head branch filled in,
+/// and a timeline `closed` gives way to a GraphQL `merged` or `open`.
 fn merge_linked_prs(detail: Live<IssueDetail>, closing: Live<Vec<LinkedPr>>) -> Live<IssueDetail> {
     let as_of = detail.as_of().min(closing.as_of());
     let mut detail = detail.into_inner();
@@ -656,7 +695,12 @@ fn merge_linked_prs(detail: Live<IssueDetail>, closing: Live<Vec<LinkedPr>>) -> 
                 if known.author.is_none() {
                     known.author = pr.author;
                 }
-                if known.state.is_none() {
+                // Fail closed: a blocking GraphQL state (merged, open) beats
+                // a timeline `closed` that may predate the merge.
+                let reopened_or_merged = pr.state.as_deref().is_some_and(|s| s != "closed");
+                if known.state.is_none()
+                    || (known.state.as_deref() == Some("closed") && reopened_or_merged)
+                {
                     known.state = pr.state;
                 }
                 if known.head_ref.is_none() {
