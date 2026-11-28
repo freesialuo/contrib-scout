@@ -18,8 +18,9 @@
 //!   with full jitter). `Retry-After` and, for exhausted quota,
 //!   `x-ratelimit-reset` replace the backoff; a 429 or secondary-rate-limit
 //!   403 with neither header waits [`RATE_LIMIT_PAUSE`] (GitHub: at least one
-//!   minute). A wait longer than `max_retry_wait` fails immediately instead
-//!   of sleeping, and later calls in this process fail fast until it passes.
+//!   minute). A server wait longer than `max_retry_wait` fails immediately
+//!   instead of sleeping, and later calls in this process fail fast until it
+//!   passes; shorter ones are waited out before each caller's token wait.
 //!   Transport errors ([`ScoutError::NetworkUnavailable`], e.g. timeouts) are
 //!   retried too.
 //! - A full all-agent *per-minute* window gets one bounded wait
@@ -701,6 +702,9 @@ impl Gateway {
     }
 
     /// Per-process token bucket plus any server-requested pause for `resource`.
+    /// Callers behind a pause wait for it to end and then for their own token,
+    /// so they stay spaced by the bucket rate. Only the server pause is checked
+    /// against `max_retry_wait`; the token wait is this process's own pacing.
     fn throttle(&self, resource: Resource, policy: HostPolicy, url: &str) -> Result<()> {
         let delay = {
             let mut buckets = lock(&self.buckets);
@@ -725,7 +729,7 @@ impl Gateway {
                 }
                 None => Duration::ZERO,
             };
-            pause.max(bucket.acquire(policy, now))
+            pause.saturating_add(bucket.acquire(policy, now))
         };
         if !delay.is_zero() {
             (self.sleep)(delay);
@@ -878,6 +882,35 @@ mod tests {
         assert_eq!(bucket.acquire(policy, start), Duration::from_millis(1000));
         let later = start + Duration::from_secs(10);
         assert_eq!(bucket.acquire(policy, later), Duration::ZERO);
+    }
+
+    #[test]
+    fn callers_behind_a_pause_keep_their_token_spacing() {
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&sleeps);
+        let gateway = Gateway::new(
+            Arc::new(crate::transport::FixtureTransport::new()),
+            HostPolicy::default(),
+            Budget::new(10),
+        )
+        .with_sleep(Arc::new(move |d| log.lock().unwrap().push(d)));
+        let policy = HostPolicy::search(); // burst 1, one token every 2s
+        gateway.defer(Resource::Search, Duration::from_secs(7), 429);
+        for _ in 0..3 {
+            gateway
+                .throttle(Resource::Search, policy, "https://api.github.com/search/x")
+                .unwrap();
+        }
+        let sleeps = sleeps.lock().unwrap().clone();
+        assert_eq!(sleeps.len(), 3, "{sleeps:?}");
+        assert!(sleeps[0] > Duration::from_millis(6900), "{sleeps:?}");
+        for pair in sleeps.windows(2) {
+            let gap = pair[1].saturating_sub(pair[0]);
+            assert!(
+                gap > Duration::from_millis(1900) && gap <= Duration::from_secs(2),
+                "{sleeps:?}"
+            );
+        }
     }
 
     #[test]
