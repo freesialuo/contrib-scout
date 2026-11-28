@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { assertNotDiverged, parseRelease, publishOnce } from './npm-release-decisions.mjs';
+
+test('limits npm installs to the operating systems and CPUs that have bundled binaries', () => {
+  const read = file => JSON.parse(readFileSync(new URL(`../npm/${file}`, import.meta.url), 'utf8'));
+  const manifest = read('package.json');
+  const targets = Object.keys(read('targets.json')).map(target => target.split('-'));
+  const unique = values => [...new Set(values)].sort();
+  assert.deepEqual(unique(manifest.os), unique(targets.map(([os]) => os)));
+  assert.deepEqual(unique(manifest.cpu), unique(targets.map(([, cpu]) => cpu)));
+});
 
 test('rejects malformed tags, leading zeroes, and build metadata', () => {
   for (const tag of ['1.2.3', 'v1.2', 'v01.2.3', 'v1.2.3-rc.01', 'v1.2.3+local', 'v1.2.3\n']) {
