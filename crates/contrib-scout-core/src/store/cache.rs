@@ -35,6 +35,16 @@ pub struct CacheStats {
     /// Row count per table.
     pub rows: BTreeMap<String, u64>,
     pub bytes: Option<u64>,
+    /// The gate audit log, which only `cache prune --gate-log-older-than` prunes.
+    pub gate_log: GateLogStats,
+}
+
+/// Size of `gate_log`: each row stores a whole gate report as JSON.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateLogStats {
+    pub rows: u64,
+    /// Bytes of the stored reasons and report snapshots (row overhead excluded).
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +56,7 @@ pub struct PruneStats {
 /// `(table, DELETE statement)` run by [`Store::prune`]; `?1` is the cutoff.
 ///
 /// Not pruned: `policy_marks`, `policy_mark_history`, `tracked_repos`, `gate_log`
-/// (audit trails), active claims, and `issues` / `sync_state` (deleting indexed
+/// (audit trails; `gate_log` only on request, see [`Store::prune_gate_log`]), active claims, and `issues` / `sync_state` (deleting indexed
 /// issues behind an incremental `since` watermark would silently lose them).
 const PRUNE: &[(&str, &str)] = &[
     ("http_cache", "DELETE FROM http_cache WHERE fetched_at < ?1"),
@@ -224,7 +234,22 @@ impl Store {
         } else {
             None
         };
-        Ok(CacheStats { rows, bytes })
+        let (gate_rows, gate_bytes): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(reasons_json AS BLOB))
+                 + COALESCE(LENGTH(CAST(snapshot_json AS BLOB)), 0)), 0)
+             FROM gate_log",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let gate_log = GateLogStats {
+            rows: u64::try_from(gate_rows).unwrap_or_default(),
+            bytes: u64::try_from(gate_bytes).unwrap_or_default(),
+        };
+        Ok(CacheStats {
+            rows,
+            bytes,
+            gate_log,
+        })
     }
 
     /// Deletes cached data fetched before `older_than`. Never touches
@@ -240,5 +265,16 @@ impl Store {
         }
         tx.commit()?;
         Ok(PruneStats { deleted })
+    }
+
+    /// Deletes `gate_log` rows whose gate ran (`as_of`) before `older_than`;
+    /// returns how many. [`Store::prune`] never does this: the log is an audit
+    /// trail, pruned only when explicitly asked (`--gate-log-older-than`).
+    pub fn prune_gate_log(&mut self, older_than: DateTime<Utc>) -> Result<u64> {
+        let count = self.conn.execute(
+            "DELETE FROM gate_log WHERE as_of < ?1",
+            params![older_than.timestamp()],
+        )?;
+        Ok(count as u64)
     }
 }

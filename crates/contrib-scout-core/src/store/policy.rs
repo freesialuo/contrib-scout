@@ -369,6 +369,15 @@ impl Store {
         rows.map(|row| row?.into_mark()).collect()
     }
 
+    /// Every stored mark, repo and org, ordered by target (case-insensitively,
+    /// as the key is unique; `policy list`). Never deletes or rewrites.
+    pub fn marks(&self) -> Result<Vec<PolicyMark>> {
+        let sql = format!("SELECT {MARK_COLUMNS} FROM policy_marks ORDER BY target");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], mark_from_row)?;
+        rows.map(|row| row?.into_mark()).collect()
+    }
+
     /// Effective marks for many repos at once (discovery's zero-request policy step, §7).
     /// Repos without a mark (own or org) are omitted.
     pub fn effective_marks(&self, repos: &[RepoName]) -> Result<Vec<(RepoName, PolicyMark)>> {

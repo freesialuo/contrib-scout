@@ -1,4 +1,4 @@
-//! `policy files|show|set|unset|due` (§5, §10). The CLI serves raw text and
+//! `policy files|show|set|unset|due|list` (§5, §10). The CLI serves raw text and
 //! stores the agent's mark; it never judges the policy itself.
 
 use super::{Context, Services};
@@ -39,6 +39,19 @@ pub enum PolicyCommand {
     },
     /// List marks that are due for review.
     Due,
+    /// List every stored mark (repo and org), sorted by target. Zero requests.
+    List(PolicyListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PolicyListArgs {
+    /// Only marks with this stance (repeatable): bans, restricts, disclose,
+    /// allows, welcomes, or none_found.
+    #[arg(long = "stance", value_name = "S")]
+    pub stances: Vec<Stance>,
+    /// Only marks whose review is due (as `policy due`).
+    #[arg(long)]
+    pub due: bool,
 }
 
 #[derive(Args, Debug)]
@@ -77,6 +90,7 @@ pub fn run(ctx: &mut Context<'_>, command: &PolicyCommand) -> Result<Report> {
         PolicyCommand::Set(args) => set(ctx, args),
         PolicyCommand::Unset { target } => unset(ctx, target),
         PolicyCommand::Due => due(ctx),
+        PolicyCommand::List(args) => list(ctx, args),
     }
 }
 
@@ -544,6 +558,25 @@ fn unset(ctx: &mut Context<'_>, target: &MarkTarget) -> Result<Report> {
     Ok(report)
 }
 
+/// One mark as `policy due` and `policy list` print it: the stored mark plus
+/// its `kind` (`repo` / `org`) and `review_due` ([`PolicyMark::review_due`]).
+fn mark_entry(mark: &PolicyMark, now: DateTime<Utc>) -> Result<Value> {
+    let mut entry = serde_json::to_value(mark)?;
+    if let Value::Object(fields) = &mut entry {
+        fields.insert("kind".into(), json!(mark.target.kind()));
+        fields.insert("review_due".into(), json!(mark.review_due(now)));
+    }
+    Ok(entry)
+}
+
+fn mark_entries(marks: &[PolicyMark], now: DateTime<Utc>) -> Result<Value> {
+    marks
+        .iter()
+        .map(|mark| mark_entry(mark, now))
+        .collect::<Result<Vec<_>>>()
+        .map(Value::Array)
+}
+
 fn due(ctx: &mut Context<'_>) -> Result<Report> {
     let store = ctx.open_store()?;
     let marks = store.due_marks(ctx.now)?;
@@ -551,7 +584,7 @@ fn due(ctx: &mut Context<'_>) -> Result<Report> {
     if marks.is_empty() {
         human.push("No marks are due for review.".into());
     }
-    let mut report = Report::new(serde_json::to_value(&marks)?);
+    let mut report = Report::new(mark_entries(&marks, ctx.now)?);
     for mark in &marks {
         match &mark.target {
             // The renderer prints repo reminders prominently; no duplicate line.
@@ -570,4 +603,45 @@ fn due(ctx: &mut Context<'_>) -> Result<Report> {
     }
     report.human = human;
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// policy list
+// ---------------------------------------------------------------------------
+
+fn list(ctx: &mut Context<'_>, args: &PolicyListArgs) -> Result<Report> {
+    let store = ctx.open_store()?;
+    let now = ctx.now;
+    let filtered = !args.stances.is_empty() || args.due;
+    let marks: Vec<PolicyMark> = store
+        .marks()?
+        .into_iter()
+        .filter(|mark| args.stances.is_empty() || args.stances.contains(&mark.stance))
+        .filter(|mark| !args.due || mark.review_due(now))
+        .collect();
+    let mut human = Vec::new();
+    if marks.is_empty() {
+        human.push(if filtered {
+            "No policy marks match.".into()
+        } else {
+            "No policy marks stored.".into()
+        });
+    }
+    for mark in &marks {
+        human.push(format!(
+            "{} {}: {} — \"{}\" (marked {} by {}; review due {}{})",
+            mark.target.kind(),
+            mark.target,
+            mark.stance.label(),
+            mark.note,
+            date(mark.marked_at),
+            mark.marked_by,
+            date(mark.expires_at),
+            if mark.review_due(now) { " (now)" } else { "" }
+        ));
+    }
+    if !marks.is_empty() {
+        human.push(format!("{} mark(s).", marks.len()));
+    }
+    Ok(Report::new(mark_entries(&marks, now)?).human(human))
 }
