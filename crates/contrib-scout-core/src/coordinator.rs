@@ -188,7 +188,8 @@ pub trait Coordinator: Send + Sync {
     fn reserve(&self, resource: Resource, n: u32) -> Result<Reservation>;
 
     /// Records the final HTTP status of a reservation's requests in
-    /// `request_log` (`None` when no response arrived). Default: nothing.
+    /// `request_log` (`Some(0)` when sent but no response arrived; `None` when
+    /// never sent, which deletes the rows). Default: nothing.
     fn settle(&self, _reservation: &Reservation, _status: Option<u16>) -> Result<()> {
         Ok(())
     }

@@ -267,6 +267,10 @@ impl GhTransport {
         if relative.is_empty() {
             bail!("empty API path");
         }
+        // The endpoint follows the flags in argv: gh would parse `-x` as one.
+        if relative.starts_with('-') {
+            bail!("API path must not start with '-': {path}");
+        }
         if relative.contains('#') {
             bail!("API path must not contain a fragment: {path}");
         }

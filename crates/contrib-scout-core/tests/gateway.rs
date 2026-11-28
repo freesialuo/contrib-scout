@@ -186,6 +186,96 @@ fn retry_after_is_honored_instead_of_backoff() {
 }
 
 #[test]
+fn rate_limit_without_headers_pauses_a_minute_and_later_calls_fail_fast() {
+    for (status, body) in [
+        (429, "too many requests"),
+        (
+            403,
+            r#"{"message":"You have exceeded a Secondary Rate Limit. Please wait."}"#,
+        ),
+    ] {
+        let h = harness(10);
+        h.fixture.expect_any_get(ApiResponse::new(status, body));
+        let error = h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap_err();
+        assert!(
+            matches!(ScoutError::find(&error), Some(ScoutError::HttpStatus { status: s, .. }) if *s == status),
+            "{status}: {error:#}"
+        );
+        // 60s > max_retry_wait (30s): no retry, no sleep.
+        assert_eq!(h.fixture.request_count(), 1, "{status}");
+        assert!(h.sleeps.lock().unwrap().is_empty(), "{status}");
+
+        // The pause is remembered: the next call fails without a request.
+        let error = h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap_err();
+        assert!(
+            matches!(ScoutError::find(&error), Some(ScoutError::HttpStatus { status: s, .. }) if *s == status),
+            "{status}: {error:#}"
+        );
+        assert_eq!(h.fixture.request_count(), 1, "{status}");
+        // The refused request was never sent, so it is not in the window log.
+        let logged = h
+            .store
+            .lock()
+            .unwrap()
+            .requests_since(None, Utc::now() - TimeDelta::minutes(1))
+            .unwrap();
+        assert_eq!(logged, 1, "{status}");
+    }
+
+    // A plain 403 without rate-limit signals is still fatal and leaves no pause.
+    let h = harness(10);
+    h.fixture.expect_any_get(ApiResponse::new(403, "forbidden"));
+    h.fixture.expect_any_get(ok_body("ok"));
+    assert!(h.gateway.send(&ApiRequest::get("/repos/o/r")).is_err());
+    assert_eq!(
+        h.gateway
+            .send(&ApiRequest::get("/repos/o/r"))
+            .unwrap()
+            .status,
+        200
+    );
+}
+
+#[test]
+fn rate_limit_minute_pause_is_slept_when_policy_allows_it() {
+    let fixture = Arc::new(FixtureTransport::new());
+    let (sleep, sleeps) = recorder();
+    let policy = HostPolicy {
+        max_retry_wait: Duration::from_secs(120),
+        ..HostPolicy::default()
+    };
+    let gateway = Gateway::new(fixture.clone(), policy, Budget::new(10)).with_sleep(sleep);
+    fixture.expect_any_get(ApiResponse::new(429, "slow down"));
+    fixture.expect_any_get(ok_body("ok"));
+    assert_eq!(
+        gateway.send(&ApiRequest::get("/repos/o/r")).unwrap().status,
+        200
+    );
+    let sleeps = sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+    assert!(
+        sleeps[0] > Duration::from_secs(59) && sleeps[0] <= Duration::from_secs(60),
+        "{sleeps:?}"
+    );
+}
+
+#[test]
+fn server_pause_is_not_cleared_by_the_first_caller() {
+    let h = harness(10);
+    h.fixture
+        .expect_any_get(ApiResponse::new(429, "slow down").header("retry-after", "7"));
+    h.fixture.expect_any_get(ok_body("ok"));
+    h.fixture.expect_any_get(ok_body("ok"));
+    h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap();
+    // The recorder does not really sleep, so the 7s pause has not passed yet:
+    // a second caller must still wait for it.
+    h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap();
+    let sleeps = h.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.len(), 2, "{sleeps:?}");
+    assert!(sleeps[1] > Duration::from_secs(6), "{sleeps:?}");
+}
+
+#[test]
 fn not_modified_serves_cached_body_and_counts_304() {
     let h = harness(10);
     let request = ApiRequest::get("/repos/o/r");
@@ -506,4 +596,75 @@ fn cache_prune_and_stats() {
     assert_eq!(pruned.deleted["request_log"], 1);
     assert!(!pruned.deleted.contains_key("policy_marks"));
     assert_eq!(store.stats().unwrap().rows["http_cache"], 0);
+}
+
+#[test]
+fn transport_failures_do_not_stay_in_flight() {
+    let h = harness(100);
+    let coordinator = h.gateway.coordinator.clone().unwrap();
+    let now = Utc::now();
+    coordinator
+        .observe(&contrib_scout_core::coordinator::QuotaSnapshot {
+            resource: Resource::Core,
+            limit: 5000,
+            remaining: 503,
+            reset_at: now + TimeDelta::minutes(30),
+            observed_at: now - TimeDelta::seconds(1),
+        })
+        .unwrap();
+    for _ in 0..2 {
+        for _ in 0..3 {
+            h.fixture.expect_network_down("/repos/o/r");
+        }
+        assert!(h.gateway.send(&ApiRequest::get("/repos/o/r")).is_err());
+    }
+    assert_eq!(h.fixture.request_count(), 6);
+    // Failed requests may have reached GitHub: they still count in the windows.
+    let logged = h
+        .store
+        .lock()
+        .unwrap()
+        .requests_since(None, Utc::now() - TimeDelta::minutes(1))
+        .unwrap();
+    assert_eq!(logged, 6);
+    // But they are not "in flight": 503 remaining is still above the reserve.
+    assert!(coordinator.reserve(Resource::Core, 1).is_ok());
+}
+
+#[test]
+fn future_fetched_at_is_treated_as_expired() {
+    let h = harness(10);
+    let key = CacheKey::for_request(&ApiRequest::get("/repos/o/r"));
+    let future = Utc::now() + TimeDelta::hours(5);
+    h.store
+        .lock()
+        .unwrap()
+        .save_response(
+            &CachedResponse {
+                key: key.as_str().to_owned(),
+                status: 200,
+                etag: Some("\"e\"".into()),
+                last_modified: None,
+                headers: vec![],
+                body: b"skewed".to_vec(),
+            },
+            future,
+        )
+        .unwrap();
+    h.fixture.expect_any_get(ApiResponse::not_modified());
+    let fetched = h
+        .gateway
+        .get(&ApiRequest::get("/repos/o/r"), Freshness::Default, HOUR)
+        .unwrap();
+    assert_eq!(fetched.origin, Origin::NotModified);
+    assert_eq!(h.fixture.request_count(), 1);
+    // The 304 pulls `fetched_at` back to now.
+    let stored = h
+        .store
+        .lock()
+        .unwrap()
+        .cached_response(key.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(stored.fetched_at <= Utc::now(), "{}", stored.fetched_at);
 }

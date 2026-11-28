@@ -177,6 +177,35 @@ fn connection_refused_is_network_unavailable() {
 }
 
 #[test]
+fn missing_token_is_an_auth_error_not_an_anonymous_request() {
+    if ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
+    {
+        eprintln!("skipped: a GitHub token is set in the environment");
+        return;
+    }
+    // Nothing listens here: an anonymous request would be network_unavailable.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let http = HttpTransport::new(None)
+        .with_api_base(base)
+        .with_gh("contrib-scout-test-missing-gh");
+    for error in [
+        http.get(&ApiRequest::get("/x")).unwrap_err(),
+        http.graphql("{ viewer { login } }", &json!({}))
+            .unwrap_err(),
+    ] {
+        assert!(ScoutError::find(&error).is_none(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("no GitHub token: set GH_TOKEN/GITHUB_TOKEN"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
 fn request_url_only_allows_the_api_origin() {
     let http = HttpTransport::new(None);
     assert_eq!(
