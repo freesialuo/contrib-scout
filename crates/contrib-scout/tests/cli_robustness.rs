@@ -57,16 +57,41 @@ fn clap_errors_emit_the_error_envelope_in_json_modes() {
         &["--ndjson", "issue", "show", "owner/repo"],
         &["issue", "show", "owner/repo", "--json"],
         &["--json", "frobnicate"],
+        &["--json", "issue"],
+        &["--ndjson", "issue"],
     ] {
         let output = fixture.run(args);
         usage_envelope(&output);
         assert!(!output.stderr.is_empty(), "{args:?}: {output:?}");
     }
 
-    let output = fixture.run(&["issue", "show", "owner/repo"]);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
-    assert!(!output.stderr.is_empty(), "{output:?}");
+    for args in [&["issue", "show", "owner/repo"][..], &["issue"]] {
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+
+    // With no env-backed arguments set, clap reports a bare `issue` as
+    // DisplayHelpOnMissingArgumentOrSubcommand and renders the whole help
+    // page; the envelope carries a short message instead. Parsing fails
+    // before any file is touched, so the default paths are never used.
+    for flag in ["--json", "--ndjson"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_contrib-scout"))
+            .current_dir(&fixture.root)
+            .env_remove("CONTRIB_SCOUT_DB")
+            .env_remove("CONTRIB_SCOUT_CONFIG")
+            .env_remove("CONTRIB_SCOUT_AGENT")
+            .args([flag, "issue"])
+            .output()
+            .unwrap();
+        let envelope = usage_envelope(&output);
+        assert_eq!(
+            envelope["error"]["message"],
+            "a subcommand or argument is missing; see --help"
+        );
+        assert!(!output.stderr.is_empty(), "{output:?}");
+    }
 }
 
 #[test]

@@ -8,7 +8,8 @@ use contrib_scout_core::ScoutError;
 use std::{io, process::ExitCode};
 
 fn main() -> ExitCode {
-    // clap exits with 2 on usage errors and 0 for --help / --version.
+    // Argument errors exit 2 (with the usage envelope under --json / --ndjson);
+    // --help and --version exit 0.
     let cli = match args::Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => return parse_failure(error),
@@ -27,9 +28,7 @@ fn main() -> ExitCode {
 fn parse_failure(error: clap::Error) -> ExitCode {
     let informational = matches!(
         error.kind(),
-        ErrorKind::DisplayHelp
-            | ErrorKind::DisplayVersion
-            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     );
     let json = std::env::args_os()
         .skip(1)
@@ -38,10 +37,18 @@ fn parse_failure(error: clap::Error) -> ExitCode {
     if informational || !json {
         error.exit();
     }
-    let rendered = error.render().to_string();
-    let message = rendered.trim();
-    let message = message.strip_prefix("error: ").unwrap_or(message);
-    render::write_error_envelope(&ScoutError::Usage(message.to_owned()).into());
+    let message = if error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        // clap renders the whole help page for this kind.
+        "a subcommand or argument is missing; see --help".to_owned()
+    } else {
+        let rendered = error.render().to_string();
+        let message = rendered.trim();
+        message
+            .strip_prefix("error: ")
+            .unwrap_or(message)
+            .to_owned()
+    };
+    render::write_error_envelope(&ScoutError::Usage(message).into());
     let _ = error.print();
     ExitCode::from(2)
 }
