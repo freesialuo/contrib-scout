@@ -2,7 +2,7 @@
 
 use super::Context;
 use crate::render::Report;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use clap::Subcommand;
 use contrib_scout_core::config::parse_duration;
@@ -110,7 +110,10 @@ fn parse_until(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
             "invalid --until {value:?}; expected YYYY-MM-DD, an RFC 3339 time, or a duration like 30d"
         ))
     })?;
-    Ok(now + TimeDelta::from_std(duration).map_err(|e| anyhow!("--until: {e}"))?)
+    TimeDelta::from_std(duration)
+        .ok()
+        .and_then(|delta| now.checked_add_signed(delta))
+        .ok_or_else(|| ScoutError::Usage("--until is too far in the future".into()).into())
 }
 
 fn add_reminders(
