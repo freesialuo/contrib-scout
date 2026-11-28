@@ -119,3 +119,36 @@ fn due_marks_lists_expired_without_deleting() {
     assert!(due[0].review_due(now));
     assert!(store.mark(&"old/repo".parse().unwrap()).unwrap().is_some());
 }
+
+#[test]
+fn marks_lists_every_repo_and_org_mark_sorted_by_target() {
+    let mut store = Store::memory().unwrap();
+    assert!(store.marks().unwrap().is_empty());
+
+    store
+        .put_mark(&mark("zeta/repo", Stance::Allows, at(1), 14))
+        .unwrap();
+    store
+        .put_mark(&mark("acme/widget", Stance::Bans, at(2), 90))
+        .unwrap();
+    store
+        .put_mark(&mark("acme", Stance::Restricts, at(3), 30))
+        .unwrap();
+    store
+        .put_mark(&mark("Beta/Thing", Stance::NoneFound, at(4), 14))
+        .unwrap();
+
+    let marks = store.marks().unwrap();
+    let targets: Vec<String> = marks.iter().map(|m| m.target.key()).collect();
+    assert_eq!(targets, ["acme", "acme/widget", "Beta/Thing", "zeta/repo"]);
+    assert_eq!(marks[0].target.kind(), "org");
+    assert_eq!(marks[1].target.kind(), "repo");
+    assert_eq!(marks[1].stance, Stance::Bans);
+    // Listing reads; it never deletes or rewrites.
+    assert_eq!(store.marks().unwrap(), marks);
+
+    let target: MarkTarget = "acme".parse().unwrap();
+    let agent: AgentId = "agent-b".parse().unwrap();
+    store.delete_mark(&target, &agent, at(5)).unwrap();
+    assert_eq!(store.marks().unwrap().len(), 3);
+}
