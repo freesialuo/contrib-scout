@@ -138,10 +138,12 @@ impl Store {
         Ok(())
     }
 
-    /// Updates `fetched_at` after a 304.
+    /// Updates `fetched_at` after a 304. Overwrites rather than keeping the
+    /// later value: a stored `fetched_at` after `at` (clock skew) would
+    /// otherwise never come back to the present.
     pub fn touch_response(&mut self, key: &str, at: DateTime<Utc>) -> Result<()> {
         self.conn.execute(
-            "UPDATE http_cache SET fetched_at = MAX(fetched_at, ?2) WHERE key = ?1",
+            "UPDATE http_cache SET fetched_at = ?2 WHERE key = ?1",
             params![key, at.timestamp()],
         )?;
         Ok(())

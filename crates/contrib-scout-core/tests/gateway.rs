@@ -507,3 +507,74 @@ fn cache_prune_and_stats() {
     assert!(!pruned.deleted.contains_key("policy_marks"));
     assert_eq!(store.stats().unwrap().rows["http_cache"], 0);
 }
+
+#[test]
+fn transport_failures_do_not_stay_in_flight() {
+    let h = harness(100);
+    let coordinator = h.gateway.coordinator.clone().unwrap();
+    let now = Utc::now();
+    coordinator
+        .observe(&contrib_scout_core::coordinator::QuotaSnapshot {
+            resource: Resource::Core,
+            limit: 5000,
+            remaining: 503,
+            reset_at: now + TimeDelta::minutes(30),
+            observed_at: now - TimeDelta::seconds(1),
+        })
+        .unwrap();
+    for _ in 0..2 {
+        for _ in 0..3 {
+            h.fixture.expect_network_down("/repos/o/r");
+        }
+        assert!(h.gateway.send(&ApiRequest::get("/repos/o/r")).is_err());
+    }
+    assert_eq!(h.fixture.request_count(), 6);
+    // Failed requests may have reached GitHub: they still count in the windows.
+    let logged = h
+        .store
+        .lock()
+        .unwrap()
+        .requests_since(None, Utc::now() - TimeDelta::minutes(1))
+        .unwrap();
+    assert_eq!(logged, 6);
+    // But they are not "in flight": 503 remaining is still above the reserve.
+    assert!(coordinator.reserve(Resource::Core, 1).is_ok());
+}
+
+#[test]
+fn future_fetched_at_is_treated_as_expired() {
+    let h = harness(10);
+    let key = CacheKey::for_request(&ApiRequest::get("/repos/o/r"));
+    let future = Utc::now() + TimeDelta::hours(5);
+    h.store
+        .lock()
+        .unwrap()
+        .save_response(
+            &CachedResponse {
+                key: key.as_str().to_owned(),
+                status: 200,
+                etag: Some("\"e\"".into()),
+                last_modified: None,
+                headers: vec![],
+                body: b"skewed".to_vec(),
+            },
+            future,
+        )
+        .unwrap();
+    h.fixture.expect_any_get(ApiResponse::not_modified());
+    let fetched = h
+        .gateway
+        .get(&ApiRequest::get("/repos/o/r"), Freshness::Default, HOUR)
+        .unwrap();
+    assert_eq!(fetched.origin, Origin::NotModified);
+    assert_eq!(h.fixture.request_count(), 1);
+    // The 304 pulls `fetched_at` back to now.
+    let stored = h
+        .store
+        .lock()
+        .unwrap()
+        .cached_response(key.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(stored.fetched_at <= Utc::now(), "{}", stored.fetched_at);
+}

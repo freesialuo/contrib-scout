@@ -576,7 +576,7 @@ impl Gateway {
                 }
             };
             if let Err(error) = self.throttle(resource, policy, url) {
-                // Nothing was sent: give the budget unit back and close the log row.
+                // Nothing was sent: give the budget unit back and drop the log row.
                 self.budget.refund();
                 if let (Some(coordinator), Some(reservation)) = (&self.coordinator, &reservation) {
                     coordinator.settle(reservation, None)?;
@@ -591,9 +591,12 @@ impl Gateway {
             let result = send();
             let now = Utc::now();
             if let Some(coordinator) = &self.coordinator {
-                let status = result.as_ref().ok().map(|response| response.status);
+                // A transport failure may still have reached GitHub: settle it
+                // as status 0, so it leaves the in-flight count but stays in
+                // the windows.
+                let status = result.as_ref().map_or(0, |response| response.status);
                 if let Some(reservation) = &reservation {
-                    coordinator.settle(reservation, status)?;
+                    coordinator.settle(reservation, Some(status))?;
                 }
                 if let Some(snapshot) = result
                     .as_ref()
@@ -727,11 +730,10 @@ impl Gateway {
     }
 }
 
+/// A `fetched_at` in the future (clock skew) counts as expired, not as age 0.
 fn needs_fetch(cached: &Cached<CachedResponse>, freshness: Freshness, ttl: Duration) -> bool {
-    let age = (Utc::now() - cached.fetched_at)
-        .to_std()
-        .unwrap_or_default();
-    freshness.needs_fetch(Some(age), ttl)
+    let age = (Utc::now() - cached.fetched_at).to_std().ok();
+    freshness.needs_fetch(age, ttl)
 }
 
 fn to_response(data: &CachedResponse) -> ApiResponse {

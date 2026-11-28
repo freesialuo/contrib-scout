@@ -166,7 +166,8 @@ impl Store {
             .optional()?;
         if let Some((remaining, reset_at, observed_at)) = fresh {
             // Requests other agents reserved after the snapshot and are still
-            // waiting for (status `NULL`) are not in `remaining` yet. Older
+            // waiting for (status `NULL`; failed sends are settled as 0 and
+            // unsent ones deleted) are not in `remaining` yet. Older
             // in-flight requests and the per-second granularity of
             // `observed_at` can still slip through; the all-agent windows
             // below bound that.
@@ -239,17 +240,22 @@ impl Store {
     }
 
     /// Fills in the HTTP status of requests logged by [`Store::reserve_requests`]
-    /// (`None` when no response was obtained).
+    /// (`0` when sent but no response was obtained), so they no longer count
+    /// as in flight. `None` means the requests were never sent: their rows are
+    /// deleted and free their window slots.
     pub fn settle_requests(&mut self, ids: &[i64], status: Option<u16>) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
         for id in ids {
-            tx.execute(
-                "UPDATE request_log SET status = ?2 WHERE id = ?1",
-                params![id, status],
-            )?;
+            match status {
+                Some(status) => tx.execute(
+                    "UPDATE request_log SET status = ?2 WHERE id = ?1",
+                    params![id, status],
+                )?,
+                None => tx.execute("DELETE FROM request_log WHERE id = ?1", params![id])?,
+            };
         }
         tx.commit()?;
         Ok(())
