@@ -91,6 +91,14 @@ const SYMLINK_MODE: u64 = 0o120000;
 /// oid) so the symlink flag survives the cache.
 const SYMLINK_TAG: &str = "git-mode:120000";
 
+/// Version of the discovery rules ([`CANDIDATE_PATHS`], [`CANDIDATE_STEMS`],
+/// [`TEMPLATE_DIRS`], symlink mode) a snapshot was listed with, kept in the
+/// snapshot marker's `etag`. The HEAD check's real ETag lives in the
+/// gateway's response cache, so the marker's copy was never read; v0.1.0
+/// stored that copy (or nothing) there, which reads as an older version.
+/// Bump it whenever discovery changes so unchanged HEADs are re-listed.
+const DISCOVERY_TAG: &str = "policy-discovery:2";
+
 /// Media type that makes `commits/{ref}` return the bare SHA.
 pub const SHA_MEDIA_TYPE: &str = "application/vnd.github.sha";
 
@@ -267,7 +275,6 @@ struct SourceState {
     repo: RepoName,
     status: u16,
     commit: Option<String>,
-    etag: Option<String>,
     origin: Origin,
     checked_at: DateTime<Utc>,
     /// Rows cached for this commit (marker excluded), when still valid.
@@ -276,6 +283,9 @@ struct SourceState {
     previous: Vec<CachedPolicyFile>,
     /// Marker or rows must be written back.
     dirty: bool,
+    /// The listing failed and `rows` (if any) are an older snapshot's: never
+    /// written back, since `commit` is already the new HEAD.
+    fallback: bool,
 }
 
 impl SourceState {
@@ -338,6 +348,7 @@ impl GitHubPolicyFiles {
                     for &i in &to_list {
                         // Either way nothing is cached for the new commit.
                         states[i].dirty = false;
+                        states[i].fallback = true;
                         if states[i].previous.is_empty() {
                             unserved.push(states[i].repo.to_string());
                         } else {
@@ -388,7 +399,9 @@ impl GitHubPolicyFiles {
 
         {
             let mut store = lock(&self.store);
-            for state in states.iter().filter(|s| s.dirty) {
+            // A fallback state may be dirty again after its text was filled,
+            // but its rows belong to the old commit: the old marker stays.
+            for state in states.iter().filter(|s| s.dirty && !s.fallback) {
                 let mut rows = vec![CachedPolicyFile {
                     repo: state.repo.clone(),
                     path: POLICY_SNAPSHOT_PATH.into(),
@@ -396,7 +409,7 @@ impl GitHubPolicyFiles {
                     file: None,
                     commit: state.commit.clone(),
                     url: Some(format!("https://github.com/{}", state.repo)),
-                    etag: state.etag.clone(),
+                    etag: Some(DISCOVERY_TAG.into()),
                     fetched_at: state.checked_at,
                 }];
                 // Restamp every row with the check time: the snapshot is
@@ -493,12 +506,18 @@ impl GitHubPolicyFiles {
         // absent). A marker for an existing source with no such rows is an
         // incomplete snapshot (e.g. pruned by an older version): a miss.
         let marker = marker.filter(|m| m.data.status != 200 || !cached_rows.is_empty());
+        // A listed snapshot made under other discovery rules (v0.1.0 markers
+        // carry the HEAD ETag there, or nothing) must be re-listed by every
+        // online read, even at the same HEAD. Offline serves it as it is.
+        let current = |m: &Cached<CachedPolicyFile>| {
+            m.data.status != 200 || m.data.etag.as_deref() == Some(DISCOVERY_TAG)
+        };
 
         if let Read::Cached(mode) = read {
             // A marker dated in the future (clock skew) is stale, not young.
-            let young = marker
-                .as_ref()
-                .is_some_and(|m| (now - m.fetched_at).to_std().is_ok_and(|age| age < ttl));
+            let young = marker.as_ref().is_some_and(|m| {
+                current(m) && (now - m.fetched_at).to_std().is_ok_and(|age| age < ttl)
+            });
             if mode == Freshness::Offline || (mode == Freshness::Default && young) {
                 let Some(marker) = marker else {
                     return Err(ScoutError::NotFound {
@@ -512,12 +531,12 @@ impl GitHubPolicyFiles {
                     repo: source.clone(),
                     status: marker.data.status,
                     commit: marker.data.commit.clone(),
-                    etag: marker.data.etag.clone(),
                     origin: Origin::Cache,
                     checked_at: marker.fetched_at,
                     rows: Some(cached_rows),
                     previous: Vec::new(),
                     dirty: false,
+                    fallback: false,
                 });
             }
         }
@@ -561,12 +580,12 @@ impl GitHubPolicyFiles {
             repo: source.clone(),
             status: response.status,
             commit: None,
-            etag: response.etag().map(str::to_owned),
             origin,
             checked_at,
             rows: None,
             previous: Vec::new(),
             dirty: true,
+            fallback: false,
         };
         if !response.is_success() {
             // 404 / 409: the source has no files.
@@ -577,9 +596,9 @@ impl GitHubPolicyFiles {
         state.status = 200;
         let commit =
             parse_commit(&response).with_context(|| format!("read {source} HEAD commit"))?;
-        let same = marker
-            .as_ref()
-            .is_some_and(|m| m.data.status == 200 && m.data.commit.as_deref() == Some(&commit));
+        let same = marker.as_ref().is_some_and(|m| {
+            m.data.status == 200 && current(m) && m.data.commit.as_deref() == Some(&commit)
+        });
         state.commit = Some(commit);
         if same {
             state.rows = Some(cached_rows);

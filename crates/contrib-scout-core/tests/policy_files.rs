@@ -5,7 +5,7 @@ use contrib_scout_core::freshness::Origin;
 use contrib_scout_core::gateway::{Budget, Gateway, HostPolicy};
 use contrib_scout_core::policy::files::{pinned_url, SHA_MEDIA_TYPE};
 use contrib_scout_core::policy::{GitHubPolicyFiles, PolicyFiles, CANDIDATE_PATHS};
-use contrib_scout_core::store::{SharedStore, Store};
+use contrib_scout_core::store::{CachedPolicyFile, SharedStore, Store, POLICY_SNAPSHOT_PATH};
 use contrib_scout_core::transport::fixture::Recorded;
 use contrib_scout_core::transport::{ApiResponse, FixtureTransport};
 use contrib_scout_core::{Freshness, RepoName, ScoutError};
@@ -802,6 +802,172 @@ fn failed_listing_without_fallback_writes_no_marker() {
     let store = h.store.lock().unwrap();
     let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
     assert_eq!(marker.data.status, 404);
+}
+
+/// A snapshot as v0.1.0 wrote it at `REPO_SHA`: the marker carries the
+/// HEAD ETag (no discovery version) and the rows predate stem matching.
+fn seed_old_snapshot(store: &SharedStore) {
+    let now = chrono::Utc::now();
+    let org: RepoName = "acme/.github".parse().unwrap();
+    let row =
+        |repo: &RepoName, path: &str, status: u16, commit: Option<&str>, etag: Option<&str>| {
+            CachedPolicyFile {
+                repo: repo.clone(),
+                path: path.into(),
+                status,
+                file: None,
+                commit: commit.map(str::to_owned),
+                url: Some(format!("https://github.com/{repo}")),
+                etag: etag.map(str::to_owned),
+                fetched_at: now,
+            }
+        };
+    let mut store = store.lock().unwrap();
+    store
+        .replace_policy_files(&org, &[row(&org, POLICY_SNAPSHOT_PATH, 404, None, None)])
+        .unwrap();
+    store
+        .replace_policy_files(
+            &repo(),
+            &[
+                row(
+                    &repo(),
+                    POLICY_SNAPSHOT_PATH,
+                    200,
+                    Some(REPO_SHA),
+                    Some("\"repo-1\""),
+                ),
+                row(&repo(), "CONTRIBUTING.md", 404, Some(REPO_SHA), None),
+            ],
+        )
+        .unwrap();
+}
+
+/// The repository's listing at `REPO_SHA` under the current rules.
+fn script_rst_listing(fixture: &FixtureTransport) {
+    let repo_listing = listing(
+        [
+            Some(vec![blob_entry("CONTRIBUTING.rst", "r-rst", 4)]),
+            None,
+            None,
+        ],
+        &[],
+    );
+    fixture.expect_graphql(graphql(json!({ "s0": repo_listing })));
+    fixture.expect_graphql(graphql(json!({"s0": {"b0": blob("r-rst", "rst\n")}})));
+}
+
+#[test]
+fn snapshots_from_older_discovery_rules_are_relisted_online() {
+    let h = harness(Config::default());
+    seed_old_snapshot(&h.store);
+
+    // Offline: cache-only, serves what is there.
+    let offline = h.service.fetch_report(&repo(), Freshness::Offline).unwrap();
+    assert_eq!(h.fixture.request_count(), 0);
+    assert!(offline.files.is_empty());
+
+    // Default within the TTL, same HEAD: the old snapshot is re-listed.
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    script_rst_listing(&h.fixture);
+    let fetch = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    let paths: Vec<&str> = fetch.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["CONTRIBUTING.rst"]);
+    assert_eq!(fetch.files[0].text.as_deref(), Some("rst\n"));
+    // Now current: no further request.
+    let count = h.fixture.request_count();
+    h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    assert_eq!(h.fixture.request_count(), count);
+
+    // Live (the gates): a 304 on HEAD does not keep an old snapshot either.
+    seed_old_snapshot(&h.store);
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture.expect_get(REPO_HEAD, ApiResponse::not_modified());
+    script_rst_listing(&h.fixture);
+    let live = Freshness::Live.live().unwrap();
+    let files = h.service.fetch_live(&repo(), live, true).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(files.get()[0].path, "CONTRIBUTING.rst");
+}
+
+#[test]
+fn a_fallback_snapshot_is_not_stored_under_the_new_commit() {
+    let h = harness(Config::default());
+    // A list-only (gate start) snapshot at REPO_SHA: text not cached.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    let old = listing(
+        [
+            Some(vec![blob_entry(
+                "CONTRIBUTING.md",
+                "r-contrib",
+                REPO_CONTRIB.len(),
+            )]),
+            None,
+            None,
+        ],
+        &[],
+    );
+    h.fixture.expect_graphql(graphql(json!({ "s0": old })));
+    let live = Freshness::Live.live().unwrap();
+    h.service.fetch_live(&repo(), live, false).unwrap();
+
+    // HEAD moves, the listing fails, the old rows are served and their
+    // missing text is fetched successfully.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA_2, "\"repo-2\""));
+    h.fixture.expect_graphql(ApiResponse::json(
+        200,
+        &json!({"data": null, "errors": [{"message": "Something went wrong"}]}),
+    ));
+    h.fixture.expect_graphql(graphql(
+        json!({"s0": {"b0": blob("r-contrib", REPO_CONTRIB)}}),
+    ));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(fetch.files[0].path, "CONTRIBUTING.md");
+    assert!(
+        fetch
+            .warnings
+            .iter()
+            .any(|w| w.contains("listing policy files failed")),
+        "{:?}",
+        fetch.warnings
+    );
+    {
+        let store = h.store.lock().unwrap();
+        let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
+        assert_eq!(
+            marker.data.commit.as_deref(),
+            Some(REPO_SHA),
+            "old commit kept"
+        );
+    }
+
+    // The next successful read at the new HEAD re-lists.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA_2, "\"repo-2\""));
+    let new = listing(
+        [
+            Some(vec![blob_entry("AI_POLICY.md", "r-ai", 9)]),
+            None,
+            None,
+        ],
+        &[("AI_POLICY.md", blob("r-ai", "No LLMs.\n"))],
+    );
+    h.fixture.expect_graphql(graphql(json!({ "s0": new })));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    let paths: Vec<&str> = fetch.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["AI_POLICY.md"]);
+    let store = h.store.lock().unwrap();
+    let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
+    assert_eq!(marker.data.commit.as_deref(), Some(REPO_SHA_2));
 }
 
 #[test]
