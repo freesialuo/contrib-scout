@@ -183,6 +183,12 @@ impl Config {
         for (key, value) in self.durations() {
             parse_duration(value).with_context(|| format!("invalid {key}"))?;
         }
+        // A zero lease expires every claim the moment it is taken. (Zero
+        // mark and cache TTLs are allowed: they force a re-check.)
+        ensure!(
+            !parse_duration(&self.claim_lease)?.is_zero(),
+            "claim_lease must be longer than zero"
+        );
         ensure!(self.max_requests > 0, "max_requests must be at least 1");
         ensure!(
             self.api_rate.is_finite()
@@ -320,9 +326,11 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
         "w" => 7 * 24 * 60 * 60,
         _ => bail!("invalid duration {value:?}; expected a number followed by s, m, h, d, or w"),
     };
-    let seconds = quantity
-        .parse::<u64>()
-        .ok()
+    // `u64::from_str` accepts a leading `+`; a duration is digits only.
+    let digits = !quantity.is_empty() && quantity.bytes().all(|b| b.is_ascii_digit());
+    let seconds = digits
+        .then(|| quantity.parse::<u64>().ok())
+        .flatten()
         .and_then(|quantity| quantity.checked_mul(multiplier))
         .and_then(|seconds| chrono::TimeDelta::try_seconds(seconds.try_into().ok()?))
         .ok_or_else(|| anyhow!("invalid duration {value:?}"))?;
