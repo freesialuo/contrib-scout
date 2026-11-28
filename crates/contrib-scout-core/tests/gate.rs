@@ -712,6 +712,69 @@ fn code_forbidden_blocks_start_and_pr_with_human_required() {
 }
 
 #[test]
+fn marks_with_values_from_a_newer_version_block() {
+    type Edit = fn(&mut PolicyMark);
+    let cases: [(Edit, &str); 4] = [
+        (
+            |m| m.stance = Stance::Unknown("forbids_bots".into()),
+            "stance: forbids_bots",
+        ),
+        (
+            |m| m.scope.pr_text = Restriction::Unknown("ai_reviewed".into()),
+            "pr_text: ai_reviewed",
+        ),
+        (
+            |m| m.scope.autonomous_agents = Restriction::Unknown("supervised".into()),
+            "autonomous_agents: supervised",
+        ),
+        (
+            |m| {
+                m.requirements
+                    .push(Requirement::Unknown(json!({"sign_cla": "v2"})))
+            },
+            "sign_cla",
+        ),
+    ];
+    for (edit, why) in cases {
+        let h = harness();
+        put_mark(&h, edit);
+        let report = start(&h, &Spec::default(), "a1");
+        assert_eq!(reasons(&report), [BlockReason::HumanRequired], "{why}");
+        let detail = &report.blocked_by[0].detail;
+        assert!(detail.contains(why), "{why}: {detail}");
+        assert!(detail.contains("does not understand"), "{detail}");
+        assert!(h.gate.claims().list(None).unwrap().is_empty(), "{why}");
+        let report = pr(&h, &Spec::default(), "a1", &PrOptions::default());
+        assert!(
+            reasons(&report).contains(&BlockReason::HumanRequired),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn merged_closing_reference_overrides_a_closed_timeline_state() {
+    let h = harness();
+    put_mark(&h, |_| {});
+    // The timeline's cross-reference says closed (no merged_at); GraphQL says merged.
+    let spec = Spec {
+        timeline: vec![linked_pr(12, "someone", "closed")],
+        closing: vec![closing_pr(12, "someone", "MERGED", "fix-widget")],
+        ..Spec::default()
+    };
+    let report = start(&h, &spec, "a1");
+    assert_eq!(reasons(&report), [BlockReason::PrExists]);
+    assert!(
+        report.blocked_by[0].detail.contains("merged"),
+        "{:?}",
+        report.blocked_by
+    );
+    let linked = &report.raw.issue.as_ref().unwrap().linked_prs;
+    assert_eq!(linked.len(), 1, "{linked:?}");
+    assert_eq!(linked[0].state.as_deref(), Some("merged"));
+}
+
+#[test]
 fn sidebar_linked_pr_without_timeline_event_blocks() {
     let h = harness();
     put_mark(&h, |_| {});

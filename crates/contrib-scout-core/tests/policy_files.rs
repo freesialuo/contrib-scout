@@ -5,7 +5,7 @@ use contrib_scout_core::freshness::Origin;
 use contrib_scout_core::gateway::{Budget, Gateway, HostPolicy};
 use contrib_scout_core::policy::files::{pinned_url, SHA_MEDIA_TYPE};
 use contrib_scout_core::policy::{GitHubPolicyFiles, PolicyFiles, CANDIDATE_PATHS};
-use contrib_scout_core::store::{SharedStore, Store};
+use contrib_scout_core::store::{CachedPolicyFile, SharedStore, Store, POLICY_SNAPSHOT_PATH};
 use contrib_scout_core::transport::fixture::Recorded;
 use contrib_scout_core::transport::{ApiResponse, FixtureTransport};
 use contrib_scout_core::{Freshness, RepoName, ScoutError};
@@ -512,6 +512,478 @@ fn prune_drops_a_snapshot_with_an_old_marker_entirely() {
     assert!(store.cached_policy_files(&repo()).unwrap().is_empty());
     let org: RepoName = "acme/.github".parse().unwrap();
     assert!(!store.cached_policy_files(&org).unwrap().is_empty());
+}
+
+#[test]
+fn offline_after_a_list_only_gate_makes_no_requests() {
+    let h = harness(Config::default());
+    // `gate start` lists without text.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    let repo_listing = listing(
+        [
+            Some(vec![blob_entry(
+                "CONTRIBUTING.md",
+                "r-contrib",
+                REPO_CONTRIB.len(),
+            )]),
+            None,
+            None,
+        ],
+        &[],
+    );
+    h.fixture
+        .expect_graphql(graphql(json!({ "s0": repo_listing })));
+    let live = Freshness::Live.live().unwrap();
+    h.service.fetch_live(&repo(), live, false).unwrap();
+    h.fixture.assert_drained();
+    let listed = h.fixture.request_count();
+
+    // Offline is cache-only: the missing text is reported, not fetched.
+    let offline = h.service.fetch_report(&repo(), Freshness::Offline).unwrap();
+    assert_eq!(h.fixture.request_count(), listed, "no request offline");
+    assert_eq!(offline.files.len(), 1);
+    assert!(offline.files[0].text.is_none());
+    assert!(
+        offline
+            .warnings
+            .iter()
+            .any(|w| w.contains("not cached") && w.contains("acme/widget/CONTRIBUTING.md")),
+        "{:?}",
+        offline.warnings
+    );
+
+    // Default: a failed text fetch is a warning, not an error.
+    let failed = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    assert_eq!(h.fixture.request_count(), listed + 1);
+    assert!(failed.files[0].text.is_none());
+    assert!(
+        failed.warnings.iter().any(|w| w.contains("text")),
+        "{:?}",
+        failed.warnings
+    );
+
+    // Once the text is fetched, offline serves it without a warning.
+    h.fixture.expect_graphql(graphql(
+        json!({"s0": {"b0": blob("r-contrib", REPO_CONTRIB)}}),
+    ));
+    let filled = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(filled.files[0].text.as_deref(), Some(REPO_CONTRIB));
+    assert!(filled.warnings.is_empty(), "{:?}", filled.warnings);
+    let offline = h.service.fetch_report(&repo(), Freshness::Offline).unwrap();
+    assert_eq!(offline.files[0].text.as_deref(), Some(REPO_CONTRIB));
+    assert!(offline.warnings.is_empty(), "{:?}", offline.warnings);
+    assert_eq!(h.fixture.request_count(), listed + 2);
+}
+
+#[test]
+fn candidates_match_by_stem_and_template_directories() {
+    let h = harness(Config::default());
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    let mut repo_listing = listing(
+        [
+            Some(vec![
+                blob_entry("CONTRIBUTING.rst", "r-rst", 4),
+                blob_entry("ai_policy.txt", "r-ai-txt", 4),
+                blob_entry("CONTRIBUTORS.md", "r-people", 4),
+                blob_entry("LICENSE", "r-license", 4),
+            ]),
+            Some(vec![
+                blob_entry("LLM_POLICY.md", "r-llm", 4),
+                json!({"name": "PULL_REQUEST_TEMPLATE", "type": "tree", "oid": "r-tpl", "object": {}}),
+            ]),
+            Some(vec![
+                blob_entry("AI_POLICY.md", "r-docs-ai", 4),
+                blob_entry("contributing", "r-docs-contrib", 4),
+            ]),
+        ],
+        &[
+            (".github/LLM_POLICY.md", blob("r-llm", "llm\n")),
+            ("docs/AI_POLICY.md", blob("r-docs-ai", "ai!\n")),
+        ],
+    );
+    repo_listing["t1_0"] = json!({"entries": [
+        blob_entry("bug.md", "r-bug", 4),
+        blob_entry("feature.md", "r-feature", 4),
+    ]});
+    h.fixture
+        .expect_graphql(graphql(json!({ "s0": repo_listing })));
+    // Matches without an exact-path text in the listing: one blob query.
+    h.fixture.expect_graphql(graphql(json!({"s0": {
+        "b0": blob("r-rst", "rst\n"),
+        "b1": blob("r-ai-txt", "txt\n"),
+        "b2": blob("r-bug", "bug\n"),
+        "b3": blob("r-feature", "fea\n"),
+        "b4": blob("r-docs-contrib", "doc\n"),
+    }})));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(h.fixture.request_count(), 4);
+
+    // The template directories are listed in the same request.
+    let requests = h.fixture.requests();
+    let Recorded::Graphql { variables, .. } = &requests[2] else {
+        panic!("expected the listing query")
+    };
+    assert_eq!(
+        variables["t0_1_0"],
+        json!(format!("{REPO_SHA}:.github/PULL_REQUEST_TEMPLATE"))
+    );
+    assert_eq!(
+        variables["t0_0_1"],
+        json!(format!("{REPO_SHA}:pull_request_template"))
+    );
+
+    let files: Vec<(&str, Option<&str>)> = fetch
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.text.as_deref()))
+        .collect();
+    assert_eq!(
+        files,
+        vec![
+            ("ai_policy.txt", Some("txt\n")),
+            (".github/LLM_POLICY.md", Some("llm\n")),
+            ("docs/AI_POLICY.md", Some("ai!\n")),
+            ("CONTRIBUTING.rst", Some("rst\n")),
+            ("docs/contributing", Some("doc\n")),
+            (".github/PULL_REQUEST_TEMPLATE/bug.md", Some("bug\n")),
+            (".github/PULL_REQUEST_TEMPLATE/feature.md", Some("fea\n")),
+        ]
+    );
+    assert_eq!(
+        fetch.files[5].url,
+        format!(
+            "https://github.com/acme/widget/blob/{REPO_SHA}/.github/PULL_REQUEST_TEMPLATE/bug.md"
+        )
+    );
+
+    // A found variant covers its candidate; the rest are absent.
+    let absent: Vec<&str> = fetch
+        .absent
+        .iter()
+        .filter(|a| a.repo == repo())
+        .map(|a| a.path.as_str())
+        .collect();
+    for covered in [
+        "AI_POLICY.md",
+        "CONTRIBUTING.md",
+        "docs/CONTRIBUTING.md",
+        ".github/LLM_POLICY.md",
+        "docs/AI_POLICY.md",
+        ".github/PULL_REQUEST_TEMPLATE.md",
+    ] {
+        assert!(!absent.contains(&covered), "{covered} in {absent:?}");
+    }
+    for missing in [
+        "LLM_POLICY.md",
+        ".github/AI_POLICY.md",
+        "docs/LLM_POLICY.md",
+        ".github/CONTRIBUTING.md",
+        "README.md",
+        "PULL_REQUEST_TEMPLATE.md",
+    ] {
+        assert!(absent.contains(&missing), "{missing} not in {absent:?}");
+    }
+
+    // Warm: the same snapshot from the cache.
+    let warm = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    assert_eq!(h.fixture.request_count(), 4);
+    let strip = |files: &[contrib_scout_core::models::PolicyFile]| {
+        files
+            .iter()
+            .map(|f| (f.path.clone(), f.url.clone(), f.text.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strip(&warm.files), strip(&fetch.files));
+    let sorted = |absent: &[contrib_scout_core::policy::AbsentPath]| {
+        let mut paths: Vec<String> = absent
+            .iter()
+            .map(|a| format!("{}/{}", a.repo, a.path))
+            .collect();
+        paths.sort();
+        paths
+    };
+    assert_eq!(sorted(&warm.absent), sorted(&fetch.absent));
+}
+
+#[test]
+fn symlinked_candidates_are_flagged() {
+    let h = harness(Config::default());
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    let mut link = blob_entry("CONTRIBUTING.md", "r-link", 20);
+    link["mode"] = json!(0o120000);
+    let mut readme = blob_entry("README.md", "r-readme", REPO_README.len());
+    readme["mode"] = json!(0o100644);
+    let repo_listing = listing(
+        [Some(vec![link, readme]), None, None],
+        &[
+            ("CONTRIBUTING.md", blob("r-link", "docs/CONTRIBUTING.md")),
+            ("README.md", blob("r-readme", REPO_README)),
+        ],
+    );
+    h.fixture
+        .expect_graphql(graphql(json!({ "s0": repo_listing })));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    // The text stays verbatim (the link target); the warning says so.
+    assert_eq!(fetch.files[0].text.as_deref(), Some("docs/CONTRIBUTING.md"));
+    let flagged = |fetch: &contrib_scout_core::policy::PolicyFetch| {
+        let hits: Vec<&String> = fetch
+            .warnings
+            .iter()
+            .filter(|w| w.contains("symbolic link"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", fetch.warnings);
+        assert!(
+            hits[0].contains("acme/widget/CONTRIBUTING.md")
+                && hits[0].contains("`docs/CONTRIBUTING.md`"),
+            "{}",
+            hits[0]
+        );
+    };
+    flagged(&fetch);
+
+    // The flag survives the cache.
+    let warm = h.service.fetch_report(&repo(), Freshness::Offline).unwrap();
+    assert_eq!(h.fixture.request_count(), 3);
+    flagged(&warm);
+}
+
+#[test]
+fn failed_listing_without_fallback_writes_no_marker() {
+    let h = harness(Config::default());
+    // The org has files; the repository does not exist yet.
+    h.fixture.expect_get(ORG_HEAD, commit(ORG_SHA, "\"org-1\""));
+    h.fixture.expect_get(REPO_HEAD, not_found());
+    let org_listing = listing(
+        [
+            Some(vec![blob_entry(
+                "CONTRIBUTING.md",
+                "o-contrib",
+                ORG_CONTRIB.len(),
+            )]),
+            None,
+            None,
+        ],
+        &[("CONTRIBUTING.md", blob("o-contrib", ORG_CONTRIB))],
+    );
+    h.fixture
+        .expect_graphql(graphql(json!({ "s0": org_listing })));
+    h.service.fetch(&repo(), Freshness::Default).unwrap();
+
+    // Both HEADs move; the listing fails.
+    h.fixture
+        .expect_get(ORG_HEAD, commit(REPO_SHA_2, "\"org-2\""));
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    h.fixture.expect_graphql(ApiResponse::json(
+        200,
+        &json!({"data": null, "errors": [{"message": "Something went wrong"}]}),
+    ));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(fetch.files.len(), 1, "the org's previous files");
+    assert!(
+        fetch
+            .warnings
+            .iter()
+            .any(|w| w.contains("acme/widget") && w.contains("no previously cached")),
+        "{:?}",
+        fetch.warnings
+    );
+    // The repository keeps its old marker: no empty snapshot was cached.
+    let store = h.store.lock().unwrap();
+    let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
+    assert_eq!(marker.data.status, 404);
+}
+
+/// A snapshot as v0.1.0 wrote it at `REPO_SHA`: the marker carries the
+/// HEAD ETag (no discovery version) and the rows predate stem matching.
+fn seed_old_snapshot(store: &SharedStore) {
+    let now = chrono::Utc::now();
+    let org: RepoName = "acme/.github".parse().unwrap();
+    let row =
+        |repo: &RepoName, path: &str, status: u16, commit: Option<&str>, etag: Option<&str>| {
+            CachedPolicyFile {
+                repo: repo.clone(),
+                path: path.into(),
+                status,
+                file: None,
+                commit: commit.map(str::to_owned),
+                url: Some(format!("https://github.com/{repo}")),
+                etag: etag.map(str::to_owned),
+                fetched_at: now,
+            }
+        };
+    let mut store = store.lock().unwrap();
+    store
+        .replace_policy_files(&org, &[row(&org, POLICY_SNAPSHOT_PATH, 404, None, None)])
+        .unwrap();
+    store
+        .replace_policy_files(
+            &repo(),
+            &[
+                row(
+                    &repo(),
+                    POLICY_SNAPSHOT_PATH,
+                    200,
+                    Some(REPO_SHA),
+                    Some("\"repo-1\""),
+                ),
+                row(&repo(), "CONTRIBUTING.md", 404, Some(REPO_SHA), None),
+            ],
+        )
+        .unwrap();
+}
+
+/// The repository's listing at `REPO_SHA` under the current rules.
+fn script_rst_listing(fixture: &FixtureTransport) {
+    let repo_listing = listing(
+        [
+            Some(vec![blob_entry("CONTRIBUTING.rst", "r-rst", 4)]),
+            None,
+            None,
+        ],
+        &[],
+    );
+    fixture.expect_graphql(graphql(json!({ "s0": repo_listing })));
+    fixture.expect_graphql(graphql(json!({"s0": {"b0": blob("r-rst", "rst\n")}})));
+}
+
+#[test]
+fn snapshots_from_older_discovery_rules_are_relisted_online() {
+    let h = harness(Config::default());
+    seed_old_snapshot(&h.store);
+
+    // Offline: cache-only, serves what is there.
+    let offline = h.service.fetch_report(&repo(), Freshness::Offline).unwrap();
+    assert_eq!(h.fixture.request_count(), 0);
+    assert!(offline.files.is_empty());
+
+    // Default within the TTL, same HEAD: the old snapshot is re-listed.
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    script_rst_listing(&h.fixture);
+    let fetch = h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    h.fixture.assert_drained();
+    let paths: Vec<&str> = fetch.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["CONTRIBUTING.rst"]);
+    assert_eq!(fetch.files[0].text.as_deref(), Some("rst\n"));
+    // Now current: no further request.
+    let count = h.fixture.request_count();
+    h.service.fetch_report(&repo(), Freshness::Default).unwrap();
+    assert_eq!(h.fixture.request_count(), count);
+
+    // Live (the gates): a 304 on HEAD does not keep an old snapshot either.
+    seed_old_snapshot(&h.store);
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture.expect_get(REPO_HEAD, ApiResponse::not_modified());
+    script_rst_listing(&h.fixture);
+    let live = Freshness::Live.live().unwrap();
+    let files = h.service.fetch_live(&repo(), live, true).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(files.get()[0].path, "CONTRIBUTING.rst");
+}
+
+#[test]
+fn a_fallback_snapshot_is_not_stored_under_the_new_commit() {
+    let h = harness(Config::default());
+    // A list-only (gate start) snapshot at REPO_SHA: text not cached.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA, "\"repo-1\""));
+    let old = listing(
+        [
+            Some(vec![blob_entry(
+                "CONTRIBUTING.md",
+                "r-contrib",
+                REPO_CONTRIB.len(),
+            )]),
+            None,
+            None,
+        ],
+        &[],
+    );
+    h.fixture.expect_graphql(graphql(json!({ "s0": old })));
+    let live = Freshness::Live.live().unwrap();
+    h.service.fetch_live(&repo(), live, false).unwrap();
+
+    // HEAD moves, the listing fails, the old rows are served and their
+    // missing text is fetched successfully.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA_2, "\"repo-2\""));
+    h.fixture.expect_graphql(ApiResponse::json(
+        200,
+        &json!({"data": null, "errors": [{"message": "Something went wrong"}]}),
+    ));
+    h.fixture.expect_graphql(graphql(
+        json!({"s0": {"b0": blob("r-contrib", REPO_CONTRIB)}}),
+    ));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    assert_eq!(fetch.files[0].path, "CONTRIBUTING.md");
+    assert!(
+        fetch
+            .warnings
+            .iter()
+            .any(|w| w.contains("listing policy files failed")),
+        "{:?}",
+        fetch.warnings
+    );
+    {
+        let store = h.store.lock().unwrap();
+        let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
+        assert_eq!(
+            marker.data.commit.as_deref(),
+            Some(REPO_SHA),
+            "old commit kept"
+        );
+    }
+
+    // The next successful read at the new HEAD re-lists.
+    h.fixture.expect_get(ORG_HEAD, not_found());
+    h.fixture
+        .expect_get(REPO_HEAD, commit(REPO_SHA_2, "\"repo-2\""));
+    let new = listing(
+        [
+            Some(vec![blob_entry("AI_POLICY.md", "r-ai", 9)]),
+            None,
+            None,
+        ],
+        &[("AI_POLICY.md", blob("r-ai", "No LLMs.\n"))],
+    );
+    h.fixture.expect_graphql(graphql(json!({ "s0": new })));
+    let fetch = h.service.fetch_report(&repo(), Freshness::Fresh).unwrap();
+    h.fixture.assert_drained();
+    let paths: Vec<&str> = fetch.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["AI_POLICY.md"]);
+    let store = h.store.lock().unwrap();
+    let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
+    assert_eq!(marker.data.commit.as_deref(), Some(REPO_SHA_2));
+}
+
+#[test]
+fn a_marker_dated_in_the_future_is_stale() {
+    let h = harness(Config::default());
+    script_cold(&h.fixture);
+    h.service.fetch(&repo(), Freshness::Default).unwrap();
+    // Clock skew: the repository's marker claims to be from tomorrow.
+    age_rows(&h.store, &repo(), -1, |path| path.is_empty());
+    h.service.fetch(&repo(), Freshness::Default).unwrap();
+    let store = h.store.lock().unwrap();
+    let marker = store.cached_policy_file(&repo(), "").unwrap().unwrap();
+    assert!(
+        marker.fetched_at <= chrono::Utc::now(),
+        "the future marker was re-checked and rewritten"
+    );
 }
 
 #[test]
