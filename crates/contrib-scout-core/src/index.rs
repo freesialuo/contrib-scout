@@ -46,7 +46,8 @@
 //! - `Default` sends nothing when the last complete pass started within
 //!   `issue_index_ttl`; `Fresh` ignores the TTL; `Offline` never sends.
 //! - One process syncs a repository at a time (`Store::lock_scope`); a second
-//!   one waits up to `lock_wait` and then re-checks the TTL.
+//!   one waits up to `lock_wait` and then re-checks the TTL. It polls the lock
+//!   without holding the store mutex, so its other threads keep the database.
 //! - List pages are sent uncached (`Gateway::send`): their `since` changes on
 //!   every pass, so conditional caching would only grow `http_cache`.
 //!
@@ -65,7 +66,7 @@ use crate::gateway::Gateway;
 use crate::models::{
     IssueComment, IssueDetail, IssueRef, IssueRow, IssueState, LinkedPr, RepoName,
 };
-use crate::store::{SharedStore, Store, SyncState};
+use crate::store::{ScopeLock, SharedStore, Store, SyncState};
 use crate::transport::{ApiRequest, ApiResponse};
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, Utc};
@@ -73,7 +74,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Why a sync sent no requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +410,20 @@ impl GitHubIndexer {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// [`Store::lock_scope`], polled so the store mutex is only held for each
+    /// attempt, not while another process keeps the lock.
+    fn lock_scope(&self, scope: &str, max_wait: Duration) -> Result<Option<ScopeLock>> {
+        let start = Instant::now();
+        loop {
+            let lock = self.store().lock_scope(scope, Duration::ZERO)?;
+            let elapsed = start.elapsed();
+            if lock.is_some() || elapsed >= max_wait {
+                return Ok(lock);
+            }
+            thread::sleep(Duration::from_millis(25).min(max_wait - elapsed));
+        }
+    }
+
     fn within_ttl(state: &SyncState, now: DateTime<Utc>, ttl: Duration) -> bool {
         !state.partial
             && state
@@ -433,7 +449,7 @@ impl GitHubIndexer {
         // One syncer per repository across processes. The guard owns a file
         // handle, not the store mutex, so the gateway can still use the store.
         let scope = format!("sync {}", repo.key());
-        let guard = self.store().lock_scope(&scope, self.config.lock_wait())?;
+        let guard = self.lock_scope(&scope, self.config.lock_wait())?;
         let Some(_guard) = guard else {
             report.skipped = Some(SyncSkip::Locked);
             report

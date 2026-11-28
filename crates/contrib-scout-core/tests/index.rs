@@ -534,6 +534,52 @@ fn a_capped_pass_stopped_early_keeps_the_pin() {
     assert_eq!(state.since, Some(at(10, 0)));
 }
 
+fn temp_db(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ))
+        .join("scout.db")
+}
+
+#[test]
+fn waiting_for_another_syncer_does_not_hold_the_store_mutex() {
+    let db = temp_db("sync-lock");
+    let store = Store::open(&db).unwrap().shared();
+    let h = harness_on(
+        store.clone(),
+        10,
+        Config {
+            lock_wait: "1s".into(),
+            ..Config::default()
+        },
+    );
+    // Another process holds the repository's sync lock.
+    let other = Store::open(&db).unwrap();
+    let held = other
+        .lock_scope("sync o/r", std::time::Duration::ZERO)
+        .unwrap();
+    assert!(held.is_some());
+
+    std::thread::scope(|scope| {
+        let syncing = scope.spawn(|| h.indexer.sync(&repo(), Freshness::Default).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // While the sync waits, this process can still use the store.
+        let free = (0..30).any(|_| {
+            let free = store.try_lock().is_ok();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            free
+        });
+        assert!(free, "the store mutex was held while waiting for the lock");
+        let report = syncing.join().unwrap();
+        assert_eq!(report.skipped, Some(SyncSkip::Locked));
+    });
+    assert_eq!(h.fixture.request_count(), 0);
+    drop(held);
+}
+
 // ---------------------------------------------------------------------------
 // Details
 // ---------------------------------------------------------------------------
