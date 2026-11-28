@@ -16,9 +16,12 @@
 //! Choices:
 //! - Only GETs are retried (max `max_attempts`, default 3; exponential backoff
 //!   with full jitter). `Retry-After` and, for exhausted quota,
-//!   `x-ratelimit-reset` replace the backoff; a wait longer than
-//!   `max_retry_wait` fails immediately instead of sleeping. Transport errors
-//!   ([`ScoutError::NetworkUnavailable`], e.g. timeouts) are retried too.
+//!   `x-ratelimit-reset` replace the backoff; a 429 or secondary-rate-limit
+//!   403 with neither header waits [`RATE_LIMIT_PAUSE`] (GitHub: at least one
+//!   minute). A wait longer than `max_retry_wait` fails immediately instead
+//!   of sleeping, and later calls in this process fail fast until it passes.
+//!   Transport errors ([`ScoutError::NetworkUnavailable`], e.g. timeouts) are
+//!   retried too.
 //! - A full all-agent *per-minute* window gets one bounded wait
 //!   ([`Gateway::window_wait`], default 3s) and one more reservation attempt;
 //!   a full per-hour window, or a quota at its reserve, fails immediately.
@@ -141,7 +144,8 @@ impl Budget {
 pub enum Disposition {
     Success,
     NotModified,
-    /// 429, 5xx, or 403 with rate-limit / `retry-after` signals.
+    /// 429, 5xx, or 403 with rate-limit / `retry-after` signals or a
+    /// "secondary rate limit" message.
     Retryable,
     /// Anything else (including 404, which callers may treat as "absent").
     Fatal,
@@ -157,8 +161,20 @@ pub fn classify(response: &ApiResponse) -> Disposition {
         {
             Disposition::Retryable
         }
+        403 if mentions_secondary_rate_limit(response) => Disposition::Retryable,
         _ => Disposition::Fatal,
     }
+}
+
+/// The pause after a 429 or secondary rate limit that names no wait: GitHub
+/// documents waiting at least one minute when neither `retry-after` nor
+/// `x-ratelimit-reset` applies.
+pub const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(60);
+
+fn mentions_secondary_rate_limit(response: &ApiResponse) -> bool {
+    String::from_utf8_lossy(&response.body)
+        .to_ascii_lowercase()
+        .contains("secondary rate limit")
 }
 
 /// Sleeps for a duration; injectable so tests run without waiting.
@@ -692,11 +708,13 @@ impl Gateway {
             let bucket = buckets
                 .entry(resource)
                 .or_insert_with(|| Bucket::new(policy, now));
-            let pause = match bucket.retry_at.take() {
+            // The pause stays set until it has passed, so every caller waits for it.
+            let pause = match bucket.retry_at {
                 Some((until, status)) => {
                     let pause = until.saturating_duration_since(now);
-                    if pause > policy.max_retry_wait {
-                        bucket.retry_at = Some((until, status));
+                    if pause.is_zero() {
+                        bucket.retry_at = None;
+                    } else if pause > policy.max_retry_wait {
                         return Err(ScoutError::HttpStatus {
                             status,
                             url: url.to_owned(),
@@ -782,7 +800,8 @@ fn backoff(policy: HostPolicy, attempt: u32) -> Duration {
 
 /// The wait the server asked for: `Retry-After` (seconds or HTTP date), and
 /// for exhausted quota (`x-ratelimit-remaining: 0`) the time until
-/// `x-ratelimit-reset`; the longer of the two.
+/// `x-ratelimit-reset`; the longer of the two. A rate-limited 429 / 403 with
+/// neither gets [`RATE_LIMIT_PAUSE`]. Only called for retryable responses.
 fn server_delay(response: &ApiResponse, policy: HostPolicy, now: SystemTime) -> Option<Duration> {
     if !policy.honor_retry_after {
         return None;
@@ -796,7 +815,9 @@ fn server_delay(response: &ApiResponse, policy: HostPolicy, now: SystemTime) -> 
         .and_then(|value| value.trim().parse::<u64>().ok())
         .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
         .map(|reset| reset.duration_since(now).unwrap_or_default());
-    retry_after.max(reset)
+    retry_after
+        .max(reset)
+        .or_else(|| matches!(response.status, 403 | 429).then_some(RATE_LIMIT_PAUSE))
 }
 
 /// `Retry-After`: delay seconds or an HTTP date.

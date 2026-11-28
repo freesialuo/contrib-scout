@@ -186,6 +186,96 @@ fn retry_after_is_honored_instead_of_backoff() {
 }
 
 #[test]
+fn rate_limit_without_headers_pauses_a_minute_and_later_calls_fail_fast() {
+    for (status, body) in [
+        (429, "too many requests"),
+        (
+            403,
+            r#"{"message":"You have exceeded a Secondary Rate Limit. Please wait."}"#,
+        ),
+    ] {
+        let h = harness(10);
+        h.fixture.expect_any_get(ApiResponse::new(status, body));
+        let error = h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap_err();
+        assert!(
+            matches!(ScoutError::find(&error), Some(ScoutError::HttpStatus { status: s, .. }) if *s == status),
+            "{status}: {error:#}"
+        );
+        // 60s > max_retry_wait (30s): no retry, no sleep.
+        assert_eq!(h.fixture.request_count(), 1, "{status}");
+        assert!(h.sleeps.lock().unwrap().is_empty(), "{status}");
+
+        // The pause is remembered: the next call fails without a request.
+        let error = h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap_err();
+        assert!(
+            matches!(ScoutError::find(&error), Some(ScoutError::HttpStatus { status: s, .. }) if *s == status),
+            "{status}: {error:#}"
+        );
+        assert_eq!(h.fixture.request_count(), 1, "{status}");
+        // The refused request was never sent, so it is not in the window log.
+        let logged = h
+            .store
+            .lock()
+            .unwrap()
+            .requests_since(None, Utc::now() - TimeDelta::minutes(1))
+            .unwrap();
+        assert_eq!(logged, 1, "{status}");
+    }
+
+    // A plain 403 without rate-limit signals is still fatal and leaves no pause.
+    let h = harness(10);
+    h.fixture.expect_any_get(ApiResponse::new(403, "forbidden"));
+    h.fixture.expect_any_get(ok_body("ok"));
+    assert!(h.gateway.send(&ApiRequest::get("/repos/o/r")).is_err());
+    assert_eq!(
+        h.gateway
+            .send(&ApiRequest::get("/repos/o/r"))
+            .unwrap()
+            .status,
+        200
+    );
+}
+
+#[test]
+fn rate_limit_minute_pause_is_slept_when_policy_allows_it() {
+    let fixture = Arc::new(FixtureTransport::new());
+    let (sleep, sleeps) = recorder();
+    let policy = HostPolicy {
+        max_retry_wait: Duration::from_secs(120),
+        ..HostPolicy::default()
+    };
+    let gateway = Gateway::new(fixture.clone(), policy, Budget::new(10)).with_sleep(sleep);
+    fixture.expect_any_get(ApiResponse::new(429, "slow down"));
+    fixture.expect_any_get(ok_body("ok"));
+    assert_eq!(
+        gateway.send(&ApiRequest::get("/repos/o/r")).unwrap().status,
+        200
+    );
+    let sleeps = sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.len(), 1, "{sleeps:?}");
+    assert!(
+        sleeps[0] > Duration::from_secs(59) && sleeps[0] <= Duration::from_secs(60),
+        "{sleeps:?}"
+    );
+}
+
+#[test]
+fn server_pause_is_not_cleared_by_the_first_caller() {
+    let h = harness(10);
+    h.fixture
+        .expect_any_get(ApiResponse::new(429, "slow down").header("retry-after", "7"));
+    h.fixture.expect_any_get(ok_body("ok"));
+    h.fixture.expect_any_get(ok_body("ok"));
+    h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap();
+    // The recorder does not really sleep, so the 7s pause has not passed yet:
+    // a second caller must still wait for it.
+    h.gateway.send(&ApiRequest::get("/repos/o/r")).unwrap();
+    let sleeps = h.sleeps.lock().unwrap().clone();
+    assert_eq!(sleeps.len(), 2, "{sleeps:?}");
+    assert!(sleeps[1] > Duration::from_secs(6), "{sleeps:?}");
+}
+
+#[test]
 fn not_modified_serves_cached_body_and_counts_304() {
     let h = harness(10);
     let request = ApiRequest::get("/repos/o/r");
