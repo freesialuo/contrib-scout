@@ -126,6 +126,19 @@ fn same_index_fields(a: &IssueRow, b: &IssueRow) -> bool {
         && a.updated_at == b.updated_at
 }
 
+/// `raw_json` for the index: GitHub's JSON without the `body`, which is
+/// fetched on demand (§6) and would only grow every row `candidates` reads.
+fn index_json(raw: &Value) -> String {
+    match raw {
+        Value::Object(map) if map.contains_key("body") => {
+            let mut map = map.clone();
+            map.remove("body");
+            Value::Object(map).to_string()
+        }
+        _ => raw.to_string(),
+    }
+}
+
 impl Store {
     pub fn issue(&self, issue: &IssueRef) -> Result<Option<Cached<IssueRow>>> {
         let sql = format!("SELECT {ISSUE_COLUMNS} FROM issues WHERE repo = ?1 AND number = ?2");
@@ -147,7 +160,8 @@ impl Store {
         .transpose()
     }
 
-    /// Upserts index fields; `raw` is GitHub's JSON for the issue. A row older
+    /// Upserts index fields; `raw` is GitHub's JSON for the issue, stored
+    /// without its `body`. A row older
     /// than the stored copy (by `updated_at`) is ignored, so an overlapping
     /// sync window or a stale detail read never regresses the index.
     pub fn save_issues(&mut self, rows: &[(IssueRow, Value)]) -> Result<SaveStats> {
@@ -197,7 +211,7 @@ impl Store {
                     i64::from(row.comments),
                     row.created_at.map(|t| t.timestamp()),
                     row.updated_at.timestamp(),
-                    raw.to_string(),
+                    index_json(raw),
                     row.fetched_at.timestamp(),
                 ])?;
             }

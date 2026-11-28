@@ -580,6 +580,25 @@ fn waiting_for_another_syncer_does_not_hold_the_store_mutex() {
     drop(held);
 }
 
+#[test]
+fn stored_index_json_drops_the_body() {
+    let db = temp_db("index-body");
+    let h = harness_on(Store::open(&db).unwrap().shared(), 10, Config::default());
+    h.fixture
+        .expect_get(FIRST, page(vec![issue(1, at(1, 0), "open", 0)], None));
+    h.indexer.sync(&repo(), Freshness::Default).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let raw: String = conn
+        .query_row("SELECT raw_json FROM issues WHERE number = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let raw: Value = serde_json::from_str(&raw).unwrap();
+    assert!(raw.get("body").is_none(), "{raw}");
+    assert_eq!(raw["number"], 1);
+    assert_eq!(raw["title"], "Issue 1");
+}
+
 // ---------------------------------------------------------------------------
 // Details
 // ---------------------------------------------------------------------------
