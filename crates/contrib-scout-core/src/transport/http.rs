@@ -4,12 +4,14 @@
 //!
 //! Only URLs on the [`HttpTransport::api_base`] origin are sent; the base must
 //! be `https` (plain `http` is accepted only for a loopback host, for tests).
-//! The token is taken from the explicit field, else `GITHUB_TOKEN` / `GH_TOKEN`,
-//! else `gh auth token`, and is never sent to any other origin.
+//! The token is taken from the explicit field, else `GH_TOKEN` / `GITHUB_TOKEN`
+//! (gh's precedence), else `gh auth token`, and is never sent to any other
+//! origin. Without a token no request is sent: anonymous requests would get
+//! 60/h and then fail as a misleading quota error.
 
 use super::{ApiRequest, ApiResponse, Transport, API_VERSION, DEFAULT_ACCEPT};
 use crate::error::{Result, ScoutError};
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, IF_NONE_MATCH};
 use reqwest::redirect::Policy;
@@ -31,7 +33,7 @@ pub struct HttpTransport {
     /// `https://api.github.com` unless GHES.
     pub api_base: String,
     /// Explicit token; when `None` it is looked up lazily via
-    /// `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`.
+    /// `GH_TOKEN`/`GITHUB_TOKEN`, then `gh auth token`.
     pub token: Option<String>,
     pub timeout: Duration,
     /// `gh` executable used for `gh auth token`.
@@ -113,13 +115,18 @@ impl HttpTransport {
         Ok(self.client.get_or_init(|| client))
     }
 
-    fn token(&self) -> Option<&str> {
+    fn token(&self) -> Result<&str> {
         if let Some(token) = &self.token {
-            return Some(token);
+            return Ok(token);
         }
         self.looked_up_token
-            .get_or_init(|| github_token(&self.gh, &self.token_hostname()))
+            .get_or_init(|| {
+                github_token(&self.gh, &self.token_hostname(), |key| env::var(key).ok())
+            })
             .as_deref()
+            .ok_or_else(|| {
+                anyhow!("no GitHub token: set GH_TOKEN/GITHUB_TOKEN or run gh auth login")
+            })
     }
 
     fn token_hostname(&self) -> String {
@@ -134,12 +141,10 @@ impl HttpTransport {
     }
 
     fn send(&self, builder: RequestBuilder, what: &str) -> Result<ApiResponse> {
-        let mut builder = builder
+        let builder = builder
             .timeout(self.timeout)
-            .header("X-GitHub-Api-Version", API_VERSION);
-        if let Some(token) = self.token() {
-            builder = builder.bearer_auth(token);
-        }
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .bearer_auth(self.token()?);
         let response = builder.send().map_err(|error| network(what, &error))?;
         let status = response.status().as_u16();
         let headers = response
@@ -180,10 +185,15 @@ fn network(what: &str, error: &reqwest::Error) -> anyhow::Error {
     ScoutError::NetworkUnavailable { message }.into()
 }
 
-/// `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token --hostname <host>`.
-fn github_token(gh: &PathBuf, hostname: &str) -> Option<String> {
-    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
-        if let Some(token) = env::var(key).ok().and_then(nonempty) {
+/// `GH_TOKEN`, then `GITHUB_TOKEN` (`var` reads the environment), then
+/// `gh auth token --hostname <host>`.
+fn github_token(
+    gh: &PathBuf,
+    hostname: &str,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Some(token) = var(key).and_then(nonempty) {
             return Some(token);
         }
     }
@@ -237,5 +247,36 @@ impl Transport for HttpTransport {
             .header(CONTENT_TYPE, "application/json")
             .body(serde_json::to_vec(&body)?);
         self.send(builder, "POST /graphql")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NO_GH: &str = "contrib-scout-test-missing-gh";
+
+    #[test]
+    fn gh_token_takes_precedence_over_github_token() {
+        let both = |key: &str| Some(format!("{key}-value"));
+        assert_eq!(
+            github_token(&NO_GH.into(), "github.com", both).as_deref(),
+            Some("GH_TOKEN-value")
+        );
+        let only_github = |key: &str| (key == "GITHUB_TOKEN").then(|| "gt".to_owned());
+        assert_eq!(
+            github_token(&NO_GH.into(), "github.com", only_github).as_deref(),
+            Some("gt")
+        );
+        let blank_gh = |key: &str| Some(if key == "GH_TOKEN" { " " } else { "gt" }.to_owned());
+        assert_eq!(
+            github_token(&NO_GH.into(), "github.com", blank_gh).as_deref(),
+            Some("gt")
+        );
+    }
+
+    #[test]
+    fn no_env_token_and_no_gh_finds_nothing() {
+        assert_eq!(github_token(&NO_GH.into(), "github.com", |_| None), None);
     }
 }

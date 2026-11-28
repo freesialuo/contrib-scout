@@ -318,6 +318,11 @@ fn refuses_foreign_origins_and_unsafe_paths_without_spawning() {
         "/x#frag",
         "/",
         "/x\r\nInjected: 1",
+        // A leading `-` would be parsed by gh as a flag.
+        "/--method=POST",
+        "-X",
+        "//-x",
+        "https://api.github.com/-x",
     ] {
         let runner = Canned::output(0, b"HTTP/2.0 200 OK\n\r\n", "");
         assert!(
