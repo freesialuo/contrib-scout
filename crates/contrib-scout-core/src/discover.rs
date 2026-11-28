@@ -25,6 +25,11 @@
 //! `shortlist`-marked issues rank first regardless of score and are exempt
 //! from `min_score`; active `skip`-marked issues are excluded unless
 //! `include_marked` (§5b).
+//!
+//! `candidates` also hides issues with an active claim (§9) held by another
+//! agent — every claimed issue when the caller has no agent id — unless
+//! `include_claimed`, and counts them in `excluded_claimed`; listed issues
+//! with an active claim carry it in `claim`.
 
 use crate::config::Config;
 use crate::error::{Result, ScoutError};
@@ -32,7 +37,8 @@ use crate::freshness::Freshness;
 use crate::gateway::Gateway;
 use crate::index::{GitHubIndexer, IssueIndexer};
 use crate::models::{
-    normalize_label, IssueRow, PolicyMark, Reminder, RepoActivity, RepoName, RepoProfile, Stance,
+    normalize_label, AgentId, Claim, IssueRow, PolicyMark, Reminder, RepoActivity, RepoName,
+    RepoProfile, Stance,
 };
 use crate::policy::reminders::reminder_for;
 use crate::profile::{GitHubProfiler, RepoProfiler};
@@ -133,6 +139,13 @@ impl CandidateMark {
     }
 }
 
+/// The active (unexpired, not released) local claim on a candidate (§9).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateClaim {
+    pub agent: AgentId,
+    pub lease_until: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
     pub issue: IssueRow,
@@ -141,6 +154,9 @@ pub struct Candidate {
     pub reasons: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mark: Option<CandidateMark>,
+    /// Set by `candidates` when the issue has an active claim; `discover` leaves it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<CandidateClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +223,19 @@ pub struct CandidateQuery {
     pub language: Option<String>,
     pub limit: u32,
     pub include_marked: bool,
+    /// The calling agent. Issues with an active claim held by anyone else are
+    /// hidden unless `include_claimed`; without an id every claimed issue is.
+    #[serde(default)]
+    pub agent: Option<AgentId>,
+    /// Do not hide issues claimed by other agents.
+    #[serde(default)]
+    pub include_claimed: bool,
+    /// Only these repositories (case-insensitive); empty means all.
+    #[serde(default)]
+    pub repos: Vec<RepoName>,
+    /// The issue must carry every one of these labels (case-insensitive).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -217,6 +246,10 @@ pub struct CandidatesReport {
     /// Issues excluded because of an active `skip` mark.
     #[serde(default)]
     pub excluded_skipped: u32,
+    /// Issues that passed every other filter but are hidden because another
+    /// agent (or, without an agent id, anyone) holds an active claim.
+    #[serde(default)]
+    pub excluded_claimed: u32,
     /// One reminder per repository in the output or excluded by a mark.
     #[serde(default)]
     pub reminders: Vec<Reminder>,
@@ -516,7 +549,16 @@ fn make_candidate(
         score: ((repo_points + issue_points) * 10.0).round() / 10.0,
         reasons,
         mark,
+        claim: None,
     }
+}
+
+/// Every label in `wanted` is on the issue, compared case-insensitively.
+fn has_all_labels(row: &IssueRow, wanted: &[String]) -> bool {
+    wanted.iter().all(|want| {
+        let want = want.trim().to_lowercase();
+        row.labels.iter().any(|l| l.trim().to_lowercase() == want)
+    })
 }
 
 impl Pipeline {
@@ -902,12 +944,27 @@ impl Discovery for Pipeline {
     fn candidates(&self, query: &CandidateQuery) -> Result<CandidatesReport> {
         let now = Utc::now();
         let store = lock(&self.store);
-        let rows = store.open_unassigned_issues(&[])?;
+        let rows = store.open_unassigned_issues(&query.repos)?;
         let issue_marks: HashMap<String, StoredIssueMark> = store
             .active_issue_marks(now)?
             .into_iter()
             .map(|m| (m.issue.to_string().to_ascii_lowercase(), m))
             .collect();
+        // Same "active" definition as the claim store and `gate start`:
+        // status active and `lease_until > now`. Should one issue ever carry
+        // several, a claim held by someone else wins (it is the one that hides).
+        let caller = query.agent.as_ref();
+        let mut claims: HashMap<String, Claim> = HashMap::new();
+        for claim in store.claims(None, now)? {
+            let key = claim.issue.to_string().to_ascii_lowercase();
+            let other = caller != Some(&claim.agent);
+            match claims.get(&key) {
+                Some(kept) if !other || caller != Some(&kept.agent) => {}
+                _ => {
+                    claims.insert(key, claim);
+                }
+            }
+        }
         let mut repos: BTreeMap<String, RepoName> = BTreeMap::new();
         for indexed in &rows {
             let repo = &indexed.row.issue.repo;
@@ -933,11 +990,12 @@ impl Discovery for Pipeline {
             candidates: Vec::new(),
             excluded_marked: 0,
             excluded_skipped: 0,
+            excluded_claimed: 0,
             reminders: Vec::new(),
         };
         let mut remind: BTreeMap<String, RepoName> = BTreeMap::new();
         for indexed in rows {
-            if indexed.is_pull_request {
+            if indexed.is_pull_request || !has_all_labels(&indexed.row, &query.labels) {
                 continue;
             }
             let repo = indexed.row.issue.repo.clone();
@@ -963,13 +1021,24 @@ impl Discovery for Pipeline {
                 report.excluded_skipped += 1;
                 continue;
             }
-            let candidate = make_candidate(indexed.row, profile, mark, now);
+            let claim = claims.get(&indexed.row.issue.to_string().to_ascii_lowercase());
+            let mut candidate = make_candidate(indexed.row, profile, mark, now);
             let shortlisted = candidate
                 .mark
                 .as_ref()
                 .is_some_and(CandidateMark::is_shortlist);
             if query.min_score.is_some_and(|min| candidate.score < min) && !shortlisted {
                 continue;
+            }
+            if let Some(claim) = claim {
+                if caller != Some(&claim.agent) && !query.include_claimed {
+                    report.excluded_claimed += 1;
+                    continue;
+                }
+                candidate.claim = Some(CandidateClaim {
+                    agent: claim.agent.clone(),
+                    lease_until: claim.lease_until,
+                });
             }
             report.candidates.push(candidate);
         }
